@@ -1,0 +1,26 @@
+# Don't ship secrets, local cache, or massive scored output blobs to the
+# container. Keep the build context tight.
+
+.env
+.env.local
+.git
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+*.egg-info
+out/
+logs/
+data/
+dashboard/  # served via Cloudflare Pages, not the API
+docs/
+tests/
+.github/
+.DS_Store

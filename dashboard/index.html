@@ -1,0 +1,3371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Auction Sniper</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif; }
+    /* 2026-09-24 the client call: everything 25% bigger. zoom scales the whole
+       UI uniformly (text, spacing, chips) without touching per-class sizes,
+       so the layout survives. The client asked 50%, settled ~20-25%; tune here. */
+    body { zoom: 1.25; }
+    [data-monospace] { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; }
+    /* Fade-out animation for ended rows */
+    @keyframes fadeout {
+      0%   { opacity: 1; transform: scale(1); max-height: 200px; }
+      80%  { opacity: 0; transform: scale(0.95); }
+      100% { opacity: 0; transform: scale(0.95); max-height: 0; padding: 0; margin: 0; border-width: 0; }
+    }
+    .ending-fade { animation: fadeout 5s ease forwards; pointer-events: none; }
+    /* Pulse for very-urgent (<10s) */
+    @keyframes urgentpulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.55; }
+    }
+    .urgent-pulse { animation: urgentpulse 1s ease-in-out infinite; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+    // -----------------------------------------------------------------------
+    // Persistence
+    // -----------------------------------------------------------------------
+
+    const STORAGE_KEY = "sniper_dashboard_v2";
+
+    // Backend API base. Production points at the Fly.io deployment; localhost
+    // falls back for dev. Watchlist add/remove syncs against this so the client's
+    // entries follow him across devices. If the backend is unreachable, the
+    // dashboard keeps working with localStorage-only state.
+    const BACKEND_URL = (() => {
+      try {
+        const h = window.location.hostname;
+        if (h === "localhost" || h === "127.0.0.1") {
+          return "http://localhost:8080";
+        }
+      } catch {}
+      return "https://your-app.fly.dev";
+    })();
+
+    // The client's curation rules (2026-08-19 call): only these TLDs are worth
+    // scanning, and nothing under $1,400 GoDaddy est. Applied to the feed
+    // tabs (Closing Soon / Top Rated). Watchlist and explicit searches are
+    // exempt — anything he starred or typed himself always shows.
+    const TLD_ALLOW = new Set(["com", "ai", "co", "net", "org", "ca", "eu"]);
+    const MIN_GD_EST = 1400;
+
+    function loadPersistedState() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); }
+      catch { return {}; }
+    }
+    function persistState(state) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+    }
+
+    // ----- API auth ---------------------------------------------------------
+    // The backend requires `Authorization: Bearer <token>` on every /api call.
+    // The token is entered once per device and kept in localStorage — it is
+    // deliberately NOT hardcoded here (this file is committed to the repo).
+
+    const TOKEN_KEY = "sniper_api_token";
+    function getApiToken() {
+      try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+    }
+    function setApiToken(t) {
+      try { localStorage.setItem(TOKEN_KEY, t); } catch {}
+    }
+
+    // Only prompt for the token once per page load, even if many parallel
+    // requests all come back 401 (the watchlist refresh fans out).
+    let tokenPromptShown = false;
+
+    // ----- Engine pulse (2026-08-26, finacredit post-mortem) ----------------
+    // The trigger worker reports its heartbeat through /health. A dead
+    // worker used to be indistinguishable from a quiet one — finacredit was
+    // lost to exactly that. This pill makes the engine state a glance.
+    function EnginePulse() {
+      const [pulse, setPulse] = useState(undefined);  // undefined=loading, null=unreachable
+      useEffect(() => {
+        let stop = false;
+        const check = async () => {
+          try {
+            // no-store is load-bearing: Chrome cached a pre-pulse /health
+            // (no worker field) and the pill screamed ENGINE DOWN at a
+            // perfectly healthy engine (2026-08-26).
+            const r = await fetch(`${BACKEND_URL}/health`, { cache: "no-store" });
+            const b = await r.json();
+            if (!stop) setPulse(b.worker || null);
+          } catch { if (!stop) setPulse(null); }
+        };
+        check();
+        const iv = setInterval(check, 30000);
+        return () => { stop = true; clearInterval(iv); };
+      }, []);
+      if (pulse === undefined) return null;
+      const tickMs = pulse && pulse.last_tick_at ? Date.parse(pulse.last_tick_at) : null;
+      const ageSec = tickMs != null ? Math.max(0, Math.round((Date.now() - tickMs) / 1000)) : null;
+      const dead = !pulse || ageSec == null || ageSec > 120;
+      const dryRun = pulse && pulse.dry_run === true;
+      const cls = dead
+        ? "bg-rose-100 text-rose-700 border-rose-300"
+        : dryRun
+          ? "bg-amber-100 text-amber-700 border-amber-300"
+          : "bg-emerald-50 text-emerald-700 border-emerald-200";
+      const label = dead
+        ? "ENGINE DOWN — auto-buys and snipes are NOT running"
+        : dryRun
+          ? "engine in DRY RUN — no real purchases"
+          : `engine live · ${ageSec}s`;
+      return (
+        <span
+          title={pulse && pulse.last_error ? `last error: ${pulse.last_error}` : (dead ? "The backend trigger worker has not ticked in over 2 minutes." : `ticks: ${pulse.ticks}, watching ${pulse.entries_last_tick} entries`)}
+          className={`text-[10px] px-2 py-0.5 rounded-full border font-semibold ${cls}`}
+        >
+          {label}
+        </span>
+      );
+    }
+
+    // Live listingType -> our auction_type (2026-08-26 cookent.com: the
+    // index said Buy Now, live said BID — the badge, and more importantly
+    // the type stored on star, must obey the live answer).
+    function liveTypeToAuctionType(lt) {
+      if (!lt) return null;
+      const u = String(lt).toUpperCase();
+      if (u.includes("CLOSEOUT")) return "CLOSEOUT";
+      if (u.includes("EXPIRY")) return "EXPIRY_AUCTION";
+      return null;
+    }
+
+    // Effective type from a live state: PRICE EVIDENCE BEATS THE LABEL.
+    // 2026-09-07 dellport: GoDaddy relists lapsed auctions with a $50
+    // buy-now while still reporting listingType=EXPIRY_AUCTIONS. If you
+    // can buy it now, it's a Buy Now — whatever their type field claims.
+    function liveEffectiveType(lv) {
+      if (!lv) return null;
+      if (lv.buy_now != null) return "CLOSEOUT";
+      return liveTypeToAuctionType(lv.listing_type);
+    }
+
+    // Per-transaction safety cap, mirrored from the backend so the
+    // confirm-to-exceed dialog (2026-09-29) triggers at the real limit.
+    // Defaults to the backend's own default; refreshed live by
+    // refreshPerTxCap() on load so raising the cap server-side stays in sync.
+    let PER_TX_CAP = 5000;
+    async function refreshPerTxCap() {
+      try {
+        const r = await apiFetch("/api/settings");
+        if (!r.ok) return;
+        const s = await r.json().catch(() => null);
+        const v = s && parseFloat(s.per_transaction_cap_dollars);
+        if (v && !isNaN(v) && v > 0) PER_TX_CAP = v;
+      } catch { /* keep the default */ }
+    }
+
+    async function apiFetch(path, opts = {}) {
+      const doFetch = () => {
+        const headers = { ...(opts.headers || {}) };
+        const tok = getApiToken();
+        if (tok) headers["Authorization"] = `Bearer ${tok}`;
+        return fetch(`${BACKEND_URL}${path}`, { ...opts, headers });
+      };
+      let r = await doFetch();
+      if (r.status === 401 && !tokenPromptShown) {
+        tokenPromptShown = true;
+        const entered = window.prompt(
+          "This device isn't linked to the backend yet.\n" +
+          "Paste the API token . It's stored on this device only:"
+        );
+        if (entered && entered.trim()) {
+          setApiToken(entered.trim());
+          r = await doFetch();
+          if (r.status !== 401) tokenPromptShown = false; // token works; re-allow future prompts
+        }
+      }
+      return r;
+    }
+
+    // ----- Backend watchlist client ----------------------------------------
+    // Thin wrapper around the REST endpoints. Returns null on any error so
+    // callers can degrade gracefully.
+
+    async function apiListWatchlist() {
+      try {
+        const r = await apiFetch(`/api/watchlist`, { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+
+    async function apiAddWatchlist(listing) {
+      try {
+        // Strip TLD off the domain to match the schema's `tld` field, which
+        // the backend uses to bootstrap an auction row if one doesn't exist.
+        const dotIdx = (listing.domain || "").lastIndexOf(".");
+        const tld = dotIdx >= 0 ? listing.domain.slice(dotIdx + 1) : "";
+        const body = {
+          listing_id: listing.listing_id,
+          domain: listing.domain,
+          tld,
+          auction_type: listing.auction_type || "EXPIRY_AUCTION",
+          current_price: listing.current_price ? String(priceNum(listing.current_price)) : null,
+          estimated_value: listing.estimated_value ? String(priceNum(listing.estimated_value)) : null,
+          end_time_utc: listing.end_time_utc || null,
+          bid_count: listing.bid_count || 0,
+          has_bids: !!listing.has_bids,
+          score: listing.score ?? null,
+        };
+        const r = await apiFetch(`/api/watchlist`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (r.status === 409) {
+          // Already on the watchlist server-side; refetch to re-sync entry_id.
+          const all = await apiListWatchlist();
+          if (all) return all.find(e => e.listing_id === listing.listing_id) || null;
+          return null;
+        }
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+
+    async function apiDeleteWatchlist(entryId) {
+      try {
+        const r = await apiFetch(`/api/watchlist/${entryId}`, {
+          method: "DELETE",
+        });
+        return r.ok;
+      } catch { return false; }
+    }
+
+    async function apiLookupDomain(domain) {
+      try {
+        const r = await apiFetch(
+          `/api/lookup?domain=${encodeURIComponent(domain)}`,
+          { cache: "no-store" }
+        );
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+
+    async function apiBuyCloseout(listing, maxTotal) {
+      // listing: the auction-card object from the data feed
+      // maxTotal: a number (dollars) the user is willing to spend
+      try {
+        const dotIdx = (listing.domain || "").lastIndexOf(".");
+        const tld = dotIdx >= 0 ? listing.domain.slice(dotIdx + 1) : "";
+        const body = {
+          listing_id: listing.listing_id,
+          domain: listing.domain,
+          tld,
+          current_price: listing.current_price ? String(priceNum(listing.current_price)) : null,
+          estimated_value: listing.estimated_value ? String(priceNum(listing.estimated_value)) : null,
+          max_total_dollars: String(maxTotal),
+        };
+        const r = await apiFetch(`/api/closeout/buy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json().catch(() => ({}));
+        return { ok: r.ok, status: r.status, body: data };
+      } catch (err) {
+        return { ok: false, status: 0, body: { detail: String(err) } };
+      }
+    }
+
+    async function apiUpdateWatchlist(entryId, patch) {
+      // patch = { max_bid_dollars?: number, is_armed?: bool, note?: string,
+      //           notify_enabled?: bool, notify_email_to?: string }
+      // Returns the updated entry, or { error: "<detail>" } so callers can
+      // show the backend's reason (e.g. "can't snipe without a real
+      // auction id") instead of a generic failure.
+      try {
+        const r = await apiFetch(`/api/watchlist/${entryId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          return { error: body.detail || `Update failed (HTTP ${r.status})` };
+        }
+        return await r.json();
+      } catch { return null; }
+    }
+
+    // -----------------------------------------------------------------------
+    // Score / price / time helpers
+    // -----------------------------------------------------------------------
+
+    function scoreColor(score) {
+      if (score >= 110) return "bg-emerald-100 text-emerald-900 border-emerald-300";
+      if (score >= 90)  return "bg-sky-100 text-sky-900 border-sky-300";
+      if (score >= 60)  return "bg-amber-100 text-amber-900 border-amber-300";
+      return "bg-slate-100 text-slate-700 border-slate-300";
+    }
+
+    function priceNum(s) {
+      if (s == null) return null;
+      const n = parseFloat(String(s).replace(/[^\d.]/g, ""));
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function formatPrice(s) {
+      const n = priceNum(s);
+      if (n == null) return "—";
+      // GoDaddy-style: $5, $1,580, $1.25 -- show cents only if non-zero
+      if (n >= 100) return `$${Math.round(n).toLocaleString()}`;
+      return n % 1 === 0 ? `$${n}` : `$${n.toFixed(2)}`;
+    }
+
+    function formatEndAbsolute(iso) {
+      if (!iso) return "";
+      return new Date(iso).toLocaleString(undefined, {
+        weekday: "short", month: "short", day: "numeric",
+        hour: "numeric", minute: "2-digit",
+      });
+    }
+
+    // Format a remaining-time count to a compact label like "3m 22s" / "2h 14m" / "5d 3h"
+    function formatRemaining(ms) {
+      if (ms <= 0) return "ENDED";
+      const totalSec = Math.floor(ms / 1000);
+      const d = Math.floor(totalSec / 86400);
+      const h = Math.floor((totalSec % 86400) / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      if (d > 0) return `${d}d ${h}h left`;
+      if (h > 0) return `${h}h ${m}m left`;
+      if (m > 0) return `${m}m ${s}s left`;
+      return `${s}s left`;
+    }
+
+    // Color class for urgency
+    function urgencyClass(ms) {
+      if (ms <= 0)            return "text-slate-400";
+      if (ms < 10 * 1000)     return "text-red-600 urgent-pulse";
+      if (ms < 10 * 60 * 1000)return "text-red-600";
+      if (ms < 60 * 60 * 1000)return "text-orange-600";
+      if (ms < 24 * 3600 * 1000) return "text-amber-700";
+      return "text-slate-600";
+    }
+
+    // Next 3 PM Pacific (handles DST via Intl). Returns a UTC epoch ms.
+    function nextThreePmPT() {
+      const now = Date.now();
+      // Iterate hour-by-hour from "now" looking for the next moment that's 15:00 in LA.
+      // 48 hours is more than enough to find 3 PM PT regardless of caller's local TZ.
+      const fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Los_Angeles",
+        hour: "numeric", hour12: false,
+      });
+      for (let i = 0; i < 48; i++) {
+        const cand = now + i * 60 * 60 * 1000;
+        const h = parseInt(fmt.format(new Date(cand)), 10);
+        if (h === 15) {
+          // Round down to the top of that hour in PT.
+          const candDate = new Date(cand);
+          const minutesInPt = parseInt(
+            new Intl.DateTimeFormat("en-US", {
+              timeZone: "America/Los_Angeles",
+              minute: "numeric", hour12: false,
+            }).format(candDate), 10
+          );
+          return cand - minutesInPt * 60 * 1000
+                       - candDate.getSeconds() * 1000
+                       - candDate.getMilliseconds();
+        }
+      }
+      return now + 24 * 60 * 60 * 1000;
+    }
+
+    // -----------------------------------------------------------------------
+    // Time-window filter chips. Each chip resolves to an "upper bound" epoch
+    // for end_time. Items with end_time <= upper are kept (and end_time >= now,
+    // we always exclude already-ended).
+    // -----------------------------------------------------------------------
+
+    const TIME_WINDOWS = [
+      // The client's morning-routine killer feature -- "what closes before GoDaddy
+      // stops accepting bids for the day" -- computed dynamically each render.
+      { id: "today_3pm", label: "Today (3 PM PT)", isToday3pm: true },
+      { id: "1h",  label: "< 1h",  hours: 1 },
+      { id: "11h", label: "< 11h", hours: 11 },
+      { id: "1d",  label: "< 1d",  hours: 24 },
+      { id: "2d",  label: "< 2d",  hours: 48 },
+      { id: "3d",  label: "< 3d",  hours: 72 },
+      { id: "7d",  label: "< 7d",  hours: 24 * 7 },
+      { id: "all", label: "All",   hours: Infinity },
+    ];
+
+    function windowUpperBoundMs(win, now) {
+      if (!win || win.id === "all") return Infinity;
+      if (win.isToday3pm) return nextThreePmPT();
+      return now + win.hours * 60 * 60 * 1000;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tick provider -- broadcasts "now" to subscribed components so countdowns
+    // update without each one running its own setInterval. We tick at 1 Hz;
+    // child components decide whether to re-render based on how close to end.
+    // -----------------------------------------------------------------------
+
+    function useTick() {
+      const [now, setNow] = useState(() => Date.now());
+      useEffect(() => {
+        const id = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(id);
+      }, []);
+      return now;
+    }
+
+    // -----------------------------------------------------------------------
+    // Top-level app
+    // -----------------------------------------------------------------------
+
+    function App() {
+      const persisted = useMemo(loadPersistedState, []);
+
+      const [data, setData] = useState(null);
+      const [loadError, setLoadError] = useState(null);
+      const [tab, setTab] = useState(persisted.tab || "closing_soon");
+      const [windowId, setWindowId] = useState(persisted.windowId || "1d");
+      const [search, setSearch] = useState(persisted.search || "");
+      const [theme, setTheme] = useState(persisted.theme || "all");
+      const [pageSize, setPageSize] = useState(persisted.pageSize || 50);
+      // Sort override. "default" = per-tab default; explicit keys take over.
+      // Per the client 2026-06-03 the most-wanted ranking is by GD value, so the
+      // "Top Rated" tab now defaults to gd_value (used to default to score).
+      const [sortBy, setSortBy] = useState(persisted.sortBy || "default");
+      // Bid vs Buy Now filter for the main tabs (The client 2026-08-18:
+      // "everything is a bid — need to see Buy Nows easier").
+      // 2026-09-07: deliberately NOT restored from localStorage. The client's
+      // machine remembered "Buy Now only" from a past session and opened
+      // to an empty list — he read it as the app being broken. Every page
+      // load starts at Bid + Buy Now; narrowing is a per-visit choice.
+      const [typeFilter, setTypeFilter] = useState("all");
+      const [selected, setSelected] = useState(null);
+      const [watchlist, setWatchlist] = useState(new Set(persisted.watchlist || []));
+      // Map<listing_id, entry_id> — populated by the backend on sync. Needed
+      // for DELETE calls (the API uses entry_id, not listing_id, in the path).
+      // listing_ids without a matching entry_id are local-only (backend was
+      // offline when added) and will sync up on the next successful add.
+      const [entryIds, setEntryIds] = useState(new Map());
+      const [endedListingIds, setEndedListingIds] = useState(new Set());
+      // Live availability map (domain -> /api/search/live state). Declared
+      // HERE, above visibleRows, because the row filter reads it — a
+      // declaration lower down is a temporal-dead-zone crash (2026-08-25).
+      const [liveValues, setLiveValues] = useState(new Map());
+
+      const now = useTick();
+
+      // Backend's full snapshot for each watchlist entry: id, domain,
+      // max_bid, is_armed. Keyed by listing_id so we can quickly
+      // read/update from a card.
+      const [entryDetails, setEntryDetails] = useState(new Map());
+
+      // Raw backend entry list from the mount fetch — input to the
+      // domain-keyed reconciliation effect below.
+      const [wlBackendEntries, setWlBackendEntries] = useState(null);
+      const reconciledRef = useRef(false);
+
+      // Live GoDaddy lookup data, refreshed on watchlist tab open. Keyed by
+      // listing_id. Each value: {current_price, bid_count, end_time_utc,
+      // refreshed_at}. The client 2026-06-03 wanted to see live bid state on
+      // watchlisted items without leaving our app — the daily-sync data
+      // can be 24h stale, this fills the gap.
+      const [freshLookups, setFreshLookups] = useState(new Map());
+      const [refreshingWatchlist, setRefreshingWatchlist] = useState(false);
+
+      // Pull the canonical watchlist from the backend on mount. Merge with
+      // local state so anything added while offline is preserved (it'll
+      // sync up on the next toggle). This is a one-shot fetch — no polling.
+      useEffect(() => {
+        let cancelled = false;
+        (async () => {
+          refreshPerTxCap();  // sync the confirm-to-exceed threshold (2026-09-29)
+          const entries = await apiListWatchlist();
+          if (cancelled || !entries) return;
+          setWlBackendEntries(entries);
+          setWatchlist(prev => {
+            const next = new Set(prev);
+            for (const e of entries) next.add(e.listing_id);
+            return next;
+          });
+          setEntryIds(prev => {
+            const next = new Map(prev);
+            for (const e of entries) next.set(e.listing_id, e.id);
+            return next;
+          });
+          setEntryDetails(prev => {
+            const next = new Map(prev);
+            for (const e of entries) {
+              next.set(e.listing_id, {
+                id: e.id,
+                domain: e.domain,
+                max_bid_dollars: e.max_bid_dollars,
+                is_armed: e.is_armed,
+                status: e.status,
+                notify_enabled: !!e.notify_enabled,
+              });
+            }
+            return next;
+          });
+        })();
+        return () => { cancelled = true; };
+      }, []);
+
+      // Refresh ALL watchlisted domains in parallel via /api/lookup. Per
+      // The client 2026-06-03 — daily-sync data is too stale for items he's
+      // actively bidding on. Skip items refreshed within the last 30s to
+      // avoid hammering GoDaddy on a tab toggle. Caller can pass force=true
+      // to override (e.g., explicit Refresh button).
+      const refreshWatchlist = useCallback(async ({ force = false } = {}) => {
+        if (!data) return;
+        const wlListings = data.listings.filter(L => watchlist.has(L.listing_id));
+        // Include backend-only entries (domain not in the current feed) so
+        // their cards still show live GoDaddy state.
+        const feedIds = new Set(wlListings.map(L => L.listing_id));
+        for (const [lid, det] of entryDetails) {
+          if (!feedIds.has(lid) && det.domain) {
+            wlListings.push({ listing_id: lid, domain: det.domain });
+          }
+        }
+        if (wlListings.length === 0) return;
+
+        const cutoff = Date.now() - 30_000;
+        const targets = force
+          ? wlListings
+          : wlListings.filter(L => {
+              const prev = freshLookups.get(L.listing_id);
+              return !prev || prev.refreshed_at < cutoff;
+            });
+        if (targets.length === 0) return;
+
+        setRefreshingWatchlist(true);
+        try {
+          const results = await Promise.all(
+            targets.map(async L => {
+              const r = await apiLookupDomain(L.domain);
+              return [L.listing_id, r];
+            })
+          );
+          setFreshLookups(prev => {
+            const next = new Map(prev);
+            const now = Date.now();
+            for (const [listingId, r] of results) {
+              if (!r) continue;
+              next.set(listingId, {
+                found: r.found,
+                current_price: r.current_price_dollars,
+                estimated_value: r.estimated_value_dollars,
+                end_time_utc: r.end_time_utc,
+                bid_count: r.bid_count,
+                refreshed_at: now,
+              });
+            }
+            return next;
+          });
+        } finally {
+          setRefreshingWatchlist(false);
+        }
+      }, [data, watchlist, freshLookups, entryDetails]);
+
+      // ----- Watchlist reconciliation (domain-keyed) --------------------
+      // 2026-07-11: the feed-parser fix rotated EVERY listing_id from a
+      // synthetic hash to the real GoDaddy auction id, orphaning all
+      // existing stars and backend entries (stored by the old ids). The
+      // durable key is the DOMAIN. Once per page load, after both the
+      // backend entries and the feed have arrived:
+      //   1. Entry whose domain is in the feed under a NEW id -> migrate
+      //      (re-add under the new id, carry max_bid/armed/note, delete old).
+      //   2. Entry whose domain is NOT in the feed -> keep; it renders as
+      //      a backend-only row and refreshes via /api/lookup.
+      //   3. Local stars matching nothing (no feed row, no backend entry)
+      //      -> pruned, so the counts stop lying.
+      useEffect(() => {
+        if (reconciledRef.current || !data || !wlBackendEntries) return;
+        reconciledRef.current = true;
+        (async () => {
+          const feedByDomain = new Map(data.listings.map(L => [L.domain, L]));
+          const feedIds = new Set(data.listings.map(L => L.listing_id));
+          const migrations = [];   // [{oldId, oldEntryId, newId, newEntry}]
+          const backendIds = new Set();
+
+          for (const e of wlBackendEntries) {
+            const L = feedByDomain.get(e.domain);
+            if (L && L.listing_id !== e.listing_id) {
+              // Same domain, rotated id — migrate the entry.
+              const newEntry = await apiAddWatchlist(L);
+              if (!newEntry || newEntry.id == null) {
+                backendIds.add(e.listing_id);  // migration failed; keep old
+                continue;
+              }
+              // Carry over the client's settings. Only send fields that hold
+              // meaningful values; PUT treats absent fields as "no change".
+              const patch = {};
+              if (e.max_bid_dollars != null) patch.max_bid_dollars = e.max_bid_dollars;
+              if (e.is_armed === false) patch.is_armed = false;
+              if (e.note) patch.note = e.note;
+              if (Object.keys(patch).length > 0) {
+                await apiUpdateWatchlist(newEntry.id, patch);
+              }
+              await apiDeleteWatchlist(e.id);
+              migrations.push({ oldId: e.listing_id, newId: L.listing_id, newEntry });
+              backendIds.add(L.listing_id);
+            } else {
+              backendIds.add(e.listing_id);
+            }
+          }
+
+          setWatchlist(prev => {
+            const next = new Set();
+            for (const id of prev) {
+              // Keep ids that still mean something; drop orphaned hashes.
+              if (feedIds.has(id) || backendIds.has(id)) next.add(id);
+            }
+            for (const m of migrations) next.add(m.newId);
+            return next;
+          });
+          if (migrations.length > 0) {
+            setEntryIds(prev => {
+              const next = new Map(prev);
+              for (const m of migrations) {
+                next.delete(m.oldId);
+                next.set(m.newId, m.newEntry.id);
+              }
+              return next;
+            });
+            setEntryDetails(prev => {
+              const next = new Map(prev);
+              for (const m of migrations) {
+                const old = next.get(m.oldId);
+                next.delete(m.oldId);
+                next.set(m.newId, {
+                  id: m.newEntry.id,
+                  domain: m.newEntry.domain,
+                  max_bid_dollars: old?.max_bid_dollars ?? m.newEntry.max_bid_dollars,
+                  is_armed: old?.is_armed ?? m.newEntry.is_armed,
+                  status: m.newEntry.status,
+                  notify_enabled: old?.notify_enabled ?? !!m.newEntry.notify_enabled,
+                });
+              }
+              return next;
+            });
+          }
+        })();
+      }, [data, wlBackendEntries]);
+
+      // Auto-refresh on watchlist tab open. Fires once on first switch
+      // to the tab; subsequent toggles within 30s reuse cached lookups.
+      //
+      // CRITICAL: include `data` in deps so the effect re-fires AFTER the
+      // initial data load completes. On a hard browser refresh, the tab
+      // state ("watchlist") is restored from localStorage BEFORE data is
+      // fetched, so the first run hits the `if (!data) return` guard
+      // inside refreshWatchlist. Once data arrives, the dep change
+      // triggers a second run that actually fetches.
+      useEffect(() => {
+        if (tab === "watchlist" && data) {
+          refreshWatchlist();
+        }
+      }, [tab, watchlist.size, data]);  // re-run when items added/removed OR data loads
+
+      // Lookup-and-add: prompt for a domain name, query GoDaddy via our
+      // /api/lookup endpoint, and add it to the watchlist if it's currently
+      // in an auction. This is the "the client pastes any domain" workflow.
+      const addByLookup = useCallback(async () => {
+        const raw = window.prompt(
+          "Enter a domain to look up (e.g., crystalpro.com or buyflexeon.com):",
+          ""
+        );
+        if (!raw) return;
+        const domain = raw.trim().toLowerCase();
+        if (!domain.includes(".")) {
+          alert(`"${raw}" doesn't look like a domain.`);
+          return;
+        }
+
+        const result = await apiLookupDomain(domain);
+        if (!result) {
+          alert(`Lookup failed for ${domain}. Backend or network issue.`);
+          return;
+        }
+        if (!result.found) {
+          alert(
+            `Couldn't find ${domain} in GoDaddy auctions.\n\n` +
+            (result.failure_message || "It may not currently be in an auction.")
+          );
+          return;
+        }
+
+        // Build a listing-shaped object so we can reuse apiAddWatchlist.
+        const listingShim = {
+          listing_id: result.listing_id || Date.now(),
+          domain: result.domain || domain,
+          auction_type: result.auction_type || "EXPIRY_AUCTION",
+          current_price: result.current_price_dollars,
+          estimated_value: result.estimated_value_dollars,
+          end_time_utc: result.end_time_utc,
+          bid_count: result.bid_count || 0,
+          has_bids: (result.bid_count || 0) > 0,
+          score: null,
+        };
+
+        const entry = await apiAddWatchlist(listingShim);
+        if (!entry) {
+          alert(
+            `Found ${domain} (${result.auction_type}) but failed to add to watchlist. ` +
+            `It may already be on the list.`
+          );
+          return;
+        }
+        // Add to local state so it shows up immediately in the Watchlist tab.
+        setWatchlist(prev => {
+          const next = new Set(prev);
+          next.add(entry.listing_id);
+          return next;
+        });
+        setEntryIds(prev => {
+          const next = new Map(prev);
+          next.set(entry.listing_id, entry.id);
+          return next;
+        });
+        setEntryDetails(prev => {
+          const next = new Map(prev);
+          next.set(entry.listing_id, {
+            id: entry.id,
+            max_bid_dollars: entry.max_bid_dollars,
+            is_armed: entry.is_armed,
+            status: entry.status,
+            notify_enabled: !!entry.notify_enabled,
+          });
+          return next;
+        });
+        alert(
+          `Added ${entry.domain} to watchlist!\n\n` +
+          `Type: ${result.auction_type}\n` +
+          `Current: ${formatPrice(result.current_price_dollars)}\n` +
+          `GD est: ${formatPrice(result.estimated_value_dollars)}\n\n` +
+          `Switch to the Watchlist tab to set a max bid.`
+        );
+      }, []);
+
+      // Listings with a Buy Now purchase currently in flight. Blocks the
+      // double-tap double-buy (audit R3): the button disables while a
+      // purchase runs, and a second tap on a slow response does nothing.
+      // The backend has its own duplicate guard as the real enforcement;
+      // this is the UX layer.
+      const [buyingIds, setBuyingIds] = useState(new Set());
+
+      // Click handler for instant-buying a closeout. Confirms with the user
+      // first showing the current price and a max-total ceiling. The backend
+      // call also re-checks the price against the ceiling so any tick-down
+      // between this click and the SOAP estimate is handled safely.
+      const buyNow = useCallback(async (listing) => {
+        const isClose = listing.auction_type === "CLOSEOUT";
+        if (!isClose) {
+          alert("Buy Now is only available for closeout listings.");
+          return;
+        }
+        if (buyingIds.has(listing.listing_id)) {
+          return;  // purchase already in flight for this listing
+        }
+        const currentPrice = priceNum(listing.current_price);
+        // We pad the ceiling by 50% over the listing price to leave room for
+        // renewal + ICANN + tax (typical total ~ 3x listing price). Worst case
+        // backend rejects with 409 if price moved out of band.
+        const defaultMax = currentPrice ? Math.max(20, Math.ceil(currentPrice * 3.5)) : 50;
+        const maxStr = window.prompt(
+          `Buy ${listing.domain} now?\n\n` +
+          `Current Buy Now price: ${formatPrice(listing.current_price)}\n` +
+          `Estimated total (with renewal+ICANN+tax): ~${formatPrice(currentPrice * 3.5)}\n\n` +
+          `Your max total ceiling in dollars (will not exceed):`,
+          String(defaultMax)
+        );
+        if (maxStr === null) return;
+        const maxTotal = Number(maxStr);
+        if (!(maxTotal > 0)) {
+          alert("Bad max total — must be a positive number.");
+          return;
+        }
+        setBuyingIds(prev => new Set(prev).add(listing.listing_id));
+        try {
+          const result = await apiBuyCloseout(listing, maxTotal);
+          if (!result.ok) {
+            alert(`Buy failed (${result.status}): ${result.body.detail || JSON.stringify(result.body)}`);
+            return;
+          }
+          const b = result.body;
+          const prefix = b.dry_run ? "[DRY RUN] " : "";
+          alert(
+            `${prefix}${b.success ? "Purchase succeeded" : "Purchase failed"}\n\n` +
+            `Domain: ${b.domain}\n` +
+            `Listing price: ${formatPrice(b.current_price_dollars)}\n` +
+            `Total cost: ${formatPrice(b.total_cost_dollars)}\n` +
+            (b.order_id ? `Order ID: ${b.order_id}\n` : "") +
+            `\n${b.message}`
+          );
+        } finally {
+          setBuyingIds(prev => {
+            const next = new Set(prev);
+            next.delete(listing.listing_id);
+            return next;
+          });
+        }
+      }, [buyingIds]);
+
+      // Click handler for editing max_bid on a watchlist entry. Uses a
+      // window.prompt for simplicity — no modal component yet. Returns
+      // the new value or null if user cancelled. Pushes to backend and
+      // updates local state on success.
+      const editMaxBid = useCallback(async (listingId, auctionType) => {
+        const det = entryDetails.get(listingId);
+        if (!det) {
+          alert("This domain isn't in your synced watchlist yet. Try refreshing the page.");
+          return;
+        }
+        const current = det.max_bid_dollars ?? "";
+        // Same field under the hood; very different meaning to the client:
+        // closeouts are fixed-price, so this is an AUTO-BUY trigger, not
+        // a bid (2026-08-18 call).
+        const isCloseoutEntry = auctionType === "CLOSEOUT";
+        const next = window.prompt(
+          isCloseoutEntry
+            ? "Auto-buy price in dollars. The system watches this closeout " +
+              "and BUYS it the moment the price drops to this or lower " +
+              "(fees included in safety caps). Leave empty to clear."
+            : "Max bid in dollars (e.g. 25 or 25.00). Leave empty to clear.",
+          current
+        );
+        if (next === null) return;  // cancelled
+
+        const trimmed = next.trim();
+        // Confirm-to-exceed (2026-09-29, the client): rather than silently
+        // rejecting a bid over the safety cap (and leaving him confused when
+        // it "doesn't work"), ask once and let him deliberately surpass it.
+        // The backend still re-checks; this just turns a silent block into a
+        // conscious choice. Clearing/lowering under the cap clears any prior
+        // override (explicit null).
+        let capOverride = null;
+        if (trimmed !== "") {
+          const amt = parseFloat(trimmed);
+          if (!isNaN(amt) && amt > PER_TX_CAP) {
+            const ok = window.confirm(
+              `$${amt.toLocaleString()} is over your $${PER_TX_CAP.toLocaleString()} ` +
+              `safety limit.\n\nThis limit protects against typos (like an extra zero). ` +
+              `Do you want to allow the sniper to spend up to $${amt.toLocaleString()} ` +
+              `on ${det.domain || "this domain"}?`
+            );
+            if (!ok) return;  // he declined — leave the bid unchanged
+            capOverride = trimmed;
+          }
+        }
+        const patch = trimmed === ""
+          ? { max_bid_dollars: null, cap_override_dollars: null }
+          : { max_bid_dollars: trimmed, cap_override_dollars: capOverride };
+        // Auto re-arm (2026-09-07 dellport lifecycle): setting a price on
+        // an entry stranded in a terminal state (executed after a 504,
+        // outbid, expired...) means "get back in there" — one action, no
+        // unstar/restar dance. The worker resumes watching immediately.
+        if (trimmed !== "" && det.status && det.status !== "pending") {
+          patch.reopen = true;
+          patch.is_armed = true;
+        }
+
+        if (det.id == null) {
+          // Entry still syncing (optimistic-star window). Queue the bid —
+          // it applies automatically the moment the backend entry lands —
+          // and reflect it in the UI right away.
+          pendingBidRef.current.set(listingId, patch);
+          setEntryDetails(prev => {
+            const next = new Map(prev);
+            const d = next.get(listingId) || {};
+            next.set(listingId, { ...d, max_bid_dollars: trimmed === "" ? null : trimmed });
+            return next;
+          });
+          return;
+        }
+        const updated = await apiUpdateWatchlist(det.id, patch);
+        if (!updated) {
+          alert("Failed to update max bid. Check your connection and try again.");
+          return;
+        }
+        if (updated.error) {
+          alert(updated.error);
+          return;
+        }
+        setEntryDetails(prev => {
+          const next = new Map(prev);
+          const old = prev.get(listingId);
+          next.set(listingId, {
+            id: updated.id,
+            domain: updated.domain || old?.domain,
+            max_bid_dollars: updated.max_bid_dollars,
+            is_armed: updated.is_armed,
+            status: updated.status,
+            notify_enabled: !!updated.notify_enabled,
+          });
+          return next;
+        });
+      }, [entryDetails]);
+
+      // Bell toggle: email reminders at 24h / 12h / 3h / 30m before close.
+      // Server-side by design — the emails have to go out while the laptop
+      // is closed, so the ONLY state that matters is notification_prefs in
+      // Postgres. We update locally first for instant feedback and roll
+      // back if the backend refuses.
+      const toggleNotify = useCallback(async (listingId) => {
+        const det = entryDetails.get(listingId);
+        if (!det) return;
+        if (det.id == null) {
+          // Still inside the optimistic-star window — there's no entry id to
+          // attach prefs to yet. Star sync takes ~1s.
+          alert("Still saving this domain — try the bell again in a second.");
+          return;
+        }
+        const nextEnabled = !det.notify_enabled;
+        setEntryDetails(prev => {
+          const next = new Map(prev);
+          const d = next.get(listingId);
+          if (d) next.set(listingId, { ...d, notify_enabled: nextEnabled });
+          return next;
+        });
+
+        const updated = await apiUpdateWatchlist(det.id, { notify_enabled: nextEnabled });
+        if (!updated || updated.error) {
+          // Roll back — a bell showing "on" that isn't on server-side is
+          // worse than no bell at all.
+          setEntryDetails(prev => {
+            const next = new Map(prev);
+            const d = next.get(listingId);
+            if (d) next.set(listingId, { ...d, notify_enabled: !nextEnabled });
+            return next;
+          });
+          alert((updated && updated.error) || "Couldn't update reminders. Check your connection.");
+          return;
+        }
+        setEntryDetails(prev => {
+          const next = new Map(prev);
+          const d = next.get(listingId);
+          next.set(listingId, {
+            ...(d || {}),
+            id: updated.id,
+            max_bid_dollars: updated.max_bid_dollars,
+            is_armed: updated.is_armed,
+            status: updated.status,
+            notify_enabled: !!updated.notify_enabled,
+          });
+          return next;
+        });
+      }, [entryDetails]);
+
+      useEffect(() => {
+        persistState({
+          tab, windowId, search, theme, pageSize, sortBy,
+          watchlist: Array.from(watchlist),
+        });
+      }, [tab, windowId, search, theme, pageSize, sortBy, watchlist]);
+
+      const loadFromFile = useCallback(async (file) => {
+        setLoadError(null);
+        try {
+          const text = await file.text();
+          const parsed = JSON.parse(text);
+          if (!parsed.listings || !Array.isArray(parsed.listings)) {
+            throw new Error("Not a scored sync JSON (no listings array)");
+          }
+          setData(parsed);
+        } catch (e) {
+          setLoadError(e.message || String(e));
+        }
+      }, []);
+
+      const loadFromUrl = useCallback(async (url) => {
+        setLoadError(null);
+        try {
+          const r = await fetch(url, { cache: "no-store" });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const parsed = await r.json();
+          if (!parsed.listings || !Array.isArray(parsed.listings)) {
+            throw new Error("Not a scored sync JSON (no listings array)");
+          }
+          setData(parsed);
+        } catch (e) {
+          setLoadError(e.message || String(e));
+        }
+      }, []);
+
+      // Auto-load on startup. data/ is canonical; out/ is the dev fallback.
+      useEffect(() => {
+        if (data) return;
+        const candidates = [
+          "../data/scored_both.json",
+          "../data/scored_expiring.json",
+          "../data/scored_closeouts.json",
+          "/data/scored_expiring.json",
+          "/data/scored_closeouts.json",
+          "../out/scored_expiring.json",
+          "../out/scored_closeouts.json",
+          "./scored_expiring.json",
+        ];
+        (async () => {
+          for (const url of candidates) {
+            try {
+              const r = await fetch(url, { cache: "no-store" });
+              if (r.ok) {
+                const parsed = await r.json();
+                if (parsed.listings && Array.isArray(parsed.listings)) {
+                  setData(parsed);
+                  return;
+                }
+              }
+            } catch {}
+          }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      const allThemes = useMemo(() => {
+        if (!data) return [];
+        const seen = new Set();
+        for (const L of data.listings) for (const t of (L.themes || [])) seen.add(t);
+        return Array.from(seen).sort();
+      }, [data]);
+
+      const win = useMemo(
+        () => TIME_WINDOWS.find(w => w.id === windowId) || TIME_WINDOWS[3],
+        [windowId]
+      );
+
+      // Build the filtered + sorted list per active tab. We re-run this on
+      // every tick so newly-ended rows drop out, but the work is cheap (the
+      // filter is O(n) and n is 5000 max).
+      const visibleRows = useMemo(() => {
+        if (!data) return [];
+        const q = (search || "").trim().toLowerCase();
+        const themeFilter = theme !== "all";
+        const windowUpper = windowUpperBoundMs(win, now);
+
+        const filtered = [];
+        for (const L of data.listings) {
+          if (q && !L.domain.toLowerCase().includes(q)) continue;
+          if (themeFilter && !(L.themes || []).includes(theme)) continue;
+          if (typeFilter !== "all" && tab !== "watchlist" && L.auction_type !== typeFilter) continue;
+          if (tab !== "watchlist") {
+            // The client's curation rules — junk TLDs and sub-$1,400 est are
+            // noise. 2026-09-19 call: nulls used to count as below the
+            // floor and vanish silently (part of the dentl-class misses).
+            // The floor now applies only when an estimate EXISTS — unknown
+            // value is shown, not hidden.
+            const tld = L.domain.slice(L.domain.lastIndexOf(".") + 1);
+            if (!TLD_ALLOW.has(tld)) continue;
+            const est = priceNum(L.estimated_value);
+            if (est != null && est < MIN_GD_EST) continue;
+          }
+
+          if (tab === "watchlist") {
+            if (!watchlist.has(L.listing_id)) continue;
+            // KEEP ended items in the watchlist (they get sorted into a
+            // separate "Expired" sub-section below). Per a 5/29 review: the client
+            // wants to review what he was watching even after it timed out.
+          } else {
+            // Both Closing Soon AND Top Rated honor the time window so
+            // The client can ask "best-scored domains closing in the next 48h"
+            // (his actual mental model per the 5/28 call). Also auto-remove
+            // already-ended items from both views.
+            // 2026-08-25 (buildultra): live availability outranks the feed.
+            // A closeout that "ended" per yesterday's feed but reappears at
+            // the next rung ($11 -> $5) MUST stay on the board. Live data
+            // also carries the new rung's end time for the countdown.
+            const lv = liveValues.get(L.domain);
+            const liveAvail = lv ? lv.status === "AVAILABLE" : null;
+            // Feed end-time parse is cached on the row (2026-09-21): this
+            // loop runs every second, and at 30k listings (The client's new
+            // ship size) 30k Date parses per tick is real jank on his
+            // machine. Parse once, remember forever — live end times still
+            // win when present.
+            if (L._endMs === undefined) {
+              L._endMs = L.end_time_utc ? new Date(L.end_time_utc).getTime() : null;
+            }
+            const endMs = (liveAvail && lv.end_time_utc)
+              ? new Date(lv.end_time_utc).getTime()
+              : L._endMs;
+            if (liveAvail === false && !endedListingIds.has(L.listing_id)) continue;
+            if (endMs == null) continue;
+            if (!liveAvail && endMs <= now && !endedListingIds.has(L.listing_id)) continue;
+            if (endMs > windowUpper) continue;
+          }
+          filtered.push(L);
+        }
+
+        // Watchlist tab: also show backend entries whose domain fell out
+        // of the current feed (auction ended, dropped below the top-5000
+        // cutoff, or added via "+ Add domain"). They'd otherwise vanish
+        // while still counting toward the badge. Live data for these
+        // comes from the /api/lookup refresh (freshLookups).
+        if (tab === "watchlist") {
+          const feedIds = new Set(data.listings.map(L => L.listing_id));
+          for (const [lid, det] of entryDetails) {
+            if (feedIds.has(lid)) continue;
+            if (!det.domain) continue;
+            if (q && !det.domain.toLowerCase().includes(q)) continue;
+            if (themeFilter) continue;  // no theme data for backend-only rows
+            filtered.push({
+              listing_id: lid,
+              domain: det.domain,
+              auction_type: null,
+              current_price: null,
+              estimated_value: null,
+              end_time_utc: null,
+              bid_count: null,
+              has_bids: false,
+              score: null,
+              themes: [],
+              _backend_only: true,
+            });
+          }
+        }
+
+        // Per-tab default sort key. The client 2026-06-03 — Top Rated now
+        // defaults to GD value (was score).
+        const defaultKey = (
+          tab === "closing_soon" ? "end_time" :
+          tab === "watchlist"    ? "score"    :
+                                   "gd_value"
+        );
+        const effectiveSort = (sortBy === "default" || !sortBy) ? defaultKey : sortBy;
+
+        const comparators = {
+          end_time: (a, b) => {
+            const aMs = a.end_time_utc ? new Date(a.end_time_utc).getTime() : Infinity;
+            const bMs = b.end_time_utc ? new Date(b.end_time_utc).getTime() : Infinity;
+            return aMs - bMs;
+          },
+          score:    (a, b) => (b.score ?? 0) - (a.score ?? 0),
+          gd_value: (a, b) => (priceNum(b.estimated_value) ?? 0) - (priceNum(a.estimated_value) ?? 0),
+          current_price: (a, b) => (priceNum(a.current_price) ?? Infinity) - (priceNum(b.current_price) ?? Infinity),
+          bid_count: (a, b) => (b.bid_count ?? 0) - (a.bid_count ?? 0),
+        };
+        filtered.sort(comparators[effectiveSort] || comparators[defaultKey]);
+
+        return filtered;
+      }, [data, tab, win, now, search, theme, sortBy, typeFilter, watchlist, endedListingIds, entryDetails, liveValues]);
+
+      // When a listing's end_time passes "now" while user is viewing, mark
+      // it for fade-out, then remove after 5s. Now runs for all tabs since
+      // they all show countdowns post-5/28.
+      useEffect(() => {
+        if (!data) return;
+        const newlyEnded = [];
+        for (const L of visibleRows.slice(0, pageSize)) {
+          // A card may only fade when the live check CONFIRMS the domain
+          // is gone. Stale feed clocks lie (buildultra), and "no live data
+          // yet" is unknown, not dead — dellport faded on page load in the
+          // race before its first live answer arrived (2026-09-07).
+          const lv = liveValues.get(L.domain);
+          if (!lv || lv.status === "AVAILABLE") continue;
+          const endMs = L.end_time_utc ? new Date(L.end_time_utc).getTime() : null;
+          if (endMs != null && endMs <= now && !endedListingIds.has(L.listing_id)) {
+            newlyEnded.push(L.listing_id);
+          }
+        }
+        if (newlyEnded.length === 0) return;
+        setEndedListingIds(prev => {
+          const next = new Set(prev);
+          newlyEnded.forEach(id => next.add(id));
+          return next;
+        });
+        // Drop them from the ended set 5s later so they truly disappear.
+        const t = setTimeout(() => {
+          setEndedListingIds(prev => {
+            const next = new Set(prev);
+            newlyEnded.forEach(id => next.delete(id));
+            return next;
+          });
+        }, 5200);
+        return () => clearTimeout(t);
+      }, [tab, visibleRows, now, pageSize, data, endedListingIds]);
+
+      const visible = visibleRows.slice(0, pageSize);
+
+      // toggleWatch accepts EITHER a listing object OR just a listing_id.
+      // Passing the listing lets us POST the auction snapshot to the backend
+      // so it can bootstrap an auctions row if needed. When only the id is
+      // available (e.g., removing from the watchlist tab), we do a local-only
+      // optimistic update and use the cached entry_id for the DELETE.
+      const toggleWatch = useCallback((listingOrId) => {
+        const isObject = typeof listingOrId === "object" && listingOrId !== null;
+        const id = isObject ? listingOrId.listing_id : listingOrId;
+        const listing = isObject ? listingOrId : null;
+
+        setWatchlist(prev => {
+          const next = new Set(prev);
+          const wasWatched = next.has(id);
+          if (wasWatched) next.delete(id); else next.add(id);
+
+          // Fire-and-forget backend sync. We've already updated the UI
+          // optimistically; if the backend call fails, the next page load
+          // will pull canonical state back from the server.
+          if (wasWatched) {
+            const entryId = entryIds.get(id);
+            if (entryId != null) {
+              apiDeleteWatchlist(entryId).then(ok => {
+                if (ok) {
+                  setEntryIds(prev => {
+                    const next = new Map(prev);
+                    next.delete(id);
+                    return next;
+                  });
+                  setEntryDetails(prev => {
+                    const next = new Map(prev);
+                    next.delete(id);
+                    return next;
+                  });
+                }
+              });
+            }
+          } else if (listing) {
+            // Optimistic entry (2026-07-15): the Set-max-bid button shows
+            // the INSTANT the star is tapped — no waiting on the backend
+            // round-trip (The client lag complaint). id=null marks it pending.
+            setEntryDetails(prev => {
+              const next = new Map(prev);
+              if (!next.has(id)) {
+                next.set(id, {
+                  id: null,
+                  domain: listing.domain,
+                  max_bid_dollars: null,
+                  is_armed: true,
+                  status: "pending",
+                  notify_enabled: false,  // reminders are opt-in per domain
+                });
+              }
+              return next;
+            });
+            apiAddWatchlist(listing).then(entry => {
+              if (!entry || entry.id == null) {
+                // Backend add failed — roll back the placeholder so the
+                // bid button doesn't point at nothing.
+                pendingBidRef.current.delete(id);
+                setEntryDetails(prev => {
+                  const next = new Map(prev);
+                  const d = next.get(id);
+                  if (d && d.id == null) next.delete(id);
+                  return next;
+                });
+                return;
+              }
+              if (entry && entry.id != null) {
+                setEntryIds(prev => {
+                  const next = new Map(prev);
+                  next.set(id, entry.id);
+                  return next;
+                });
+                setEntryDetails(prev => {
+                  const next = new Map(prev);
+                  next.set(id, {
+                    id: entry.id,
+                    domain: entry.domain || (listing && listing.domain),
+                    max_bid_dollars: entry.max_bid_dollars,
+                    is_armed: entry.is_armed,
+                    status: entry.status,
+                    notify_enabled: !!entry.notify_enabled,
+                  });
+                  return next;
+                });
+                // Apply a max bid the client typed during the optimistic window.
+                const queued = pendingBidRef.current.get(id);
+                if (queued) {
+                  pendingBidRef.current.delete(id);
+                  apiUpdateWatchlist(entry.id, queued).then(updated => {
+                    if (updated && !updated.error) {
+                      setEntryDetails(prev => {
+                        const next = new Map(prev);
+                        next.set(id, {
+                          id: updated.id,
+                          domain: updated.domain || entry.domain,
+                          max_bid_dollars: updated.max_bid_dollars,
+                          is_armed: updated.is_armed,
+                          status: updated.status,
+                          notify_enabled: !!updated.notify_enabled,
+                        });
+                        return next;
+                      });
+                    } else if (updated && updated.error) {
+                      alert(updated.error);
+                    }
+                  });
+                }
+              }
+            });
+          }
+          return next;
+        });
+      }, [entryIds]);
+
+      // Estibot values by domain, fetched lazily for whatever's on screen
+      // (2026-07-14: the client wants GD + Estibot side by side on EVERY card).
+      // Map value null = "asked Estibot, no appraisal" so we don't refetch.
+      const [ebValues, setEbValues] = useState(new Map());
+      // In-flight guard: the 1s countdown tick recreates `visible` every
+      // second, which used to re-fire this effect and send the SAME batch
+      // to Estibot 5-6 times before the first response landed (seen in Fly
+      // logs 2026-07-14). Domains listed here are awaiting a response and
+      // must not be requested again.
+      const ebInFlight = useRef(new Set());
+      // Live overlay: domain -> {status, price, end_time_utc, ...} refreshed
+      // every 60s for whatever's on screen. Stale feed prices get replaced;
+      // sold/ended domains get tagged GONE instead of haunting the list.
+      const visibleRef = useRef([]);
+      // Max bids entered BEFORE the backend watchlist entry exists (the
+      // optimistic-star window, ~1s). Applied automatically when the POST
+      // returns. listingId -> patch.
+      const pendingBidRef = useRef(new Map());
+      useEffect(() => {
+        const missing = [];
+        for (const L of visible) {
+          if (L.domain && !ebValues.has(L.domain) && !ebInFlight.current.has(L.domain)) {
+            missing.push(L.domain);
+          }
+        }
+        if (missing.length === 0) return;
+        const t = setTimeout(async () => {
+          const batch = missing.slice(0, 200);
+          batch.forEach(d => ebInFlight.current.add(d));
+          try {
+            const values = await apiEstibotBatch(batch);
+            if (!values) return;
+            setEbValues(prev => {
+              const next = new Map(prev);
+              for (const d of batch) next.set(d, values[d] != null ? values[d] : null);
+              return next;
+            });
+          } finally {
+            batch.forEach(d => ebInFlight.current.delete(d));
+          }
+        }, 400);  // debounce scroll/tab churn
+        return () => clearTimeout(t);
+      }, [visible, ebValues]);
+
+      // On-demand signals for the detail drawer (2026-08-26: Top Value rows
+      // are now clickable, but ebValues only covers main-tab rows — fetch
+      // the one domain being inspected if we don't have its signals yet).
+      useEffect(() => {
+        if (!selected || !selected.domain) return;
+        if (ebValues.get(selected.domain)) return;
+        let stop = false;
+        (async () => {
+          const sig = await apiEstibotBatch([selected.domain]);
+          if (!sig || stop) return;
+          setEbValues(prev => {
+            const next = new Map(prev);
+            next.set(selected.domain, sig[selected.domain] != null ? sig[selected.domain] : null);
+            return next;
+          });
+        })();
+        return () => { stop = true; };
+      }, [selected]);
+
+      visibleRef.current = visible;
+      // Re-tick when the visible DOMAIN SET changes (search, tab switch,
+      // scroll-load) — throttled to one call per 5s so keystrokes can't
+      // hammer the availability API. The 60s interval still runs.
+      const visKey = visible.slice(0, 50).map(L => L.domain).join(",");
+      const lastLiveTickRef = useRef(0);
+      useEffect(() => {
+        if (!data) return;
+        let cancelled = false;
+        const tick = async () => {
+          lastLiveTickRef.current = Date.now();
+          const watchedDoms = new Set(
+            Array.from(entryDetails.values()).map(det => det.domain).filter(Boolean)
+          );
+          // Coverage (2026-09-07: the client starred a batch from Top Value and
+          // most sank into Old unverified): on the WATCHLIST tab, live-check
+          // EVERY entry — not just the first 50 visible rows. Backend-only
+          // stars sort last and never got polled, so they never got their
+          // "alive" verdict. Chunked by 50 (the API's bulk cap), max 200.
+          let doms = visibleRef.current.slice(0, 50).map(L => L.domain).filter(Boolean);
+          if (tab === "watchlist") {
+            doms = [...new Set([...doms, ...watchedDoms])].slice(0, 200);
+          }
+          if (doms.length === 0) return;
+          for (let i = 0; i < doms.length; i += 50) {
+            if (cancelled) return;
+            const chunk = doms.slice(i, i + 50);
+            // Watchlisted domains get the estimate cross-check ("gone" is
+            // only believed after BOTH GoDaddy APIs agree — myhomebills).
+            const live = await apiLiveBatch(chunk, chunk.filter(dm => watchedDoms.has(dm)));
+            if (!live || cancelled) return;
+            setLiveValues(prev => {
+              const next = new Map(prev);
+              for (const [dom, st] of Object.entries(live)) next.set(dom, { ...st, _at: Date.now() });
+              return next;
+            });
+          }
+        };
+        const since = Date.now() - lastLiveTickRef.current;
+        const t = setTimeout(tick, since >= 5000 ? 250 : 5000 - since);
+        const iv = setInterval(tick, 60000);
+        return () => { cancelled = true; clearTimeout(t); clearInterval(iv); };
+      }, [data, tab, visKey, entryDetails]);
+
+      // Live watchlist count — mirrors the WatchlistView Live/Old split so
+      // the header badge and tab label only count auctions that are
+      // plausibly still live (in today's feed, or verified via lookup, and
+      // inside the 10-day expiry window). Old/relisted/ended entries render
+      // in the "Old" section but don't inflate the number.
+      const liveWatchCount = useMemo(() => {
+        if (!data) return watchlist.size;
+        const feedById = new Map(data.listings.map(L => [L.listing_id, L]));
+        let n = 0;
+        for (const id of watchlist) {
+          const L = feedById.get(id);
+          const fresh = freshLookups.get(id);
+          const endRaw = (fresh && fresh.end_time_utc) || (L && L.end_time_utc);
+          const endMs = endRaw ? new Date(endRaw).getTime() : null;
+          const reason = watchRowOldReason({ inFeed: !!L, fresh, endMs, now });
+          if (!reason) n++;
+        }
+        return n;
+      }, [data, watchlist, freshLookups, now]);
+
+      if (!data) {
+        return <EmptyState
+          loadFromFile={loadFromFile}
+          loadFromUrl={loadFromUrl}
+          error={loadError}
+        />;
+      }
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* ONE sticky unit: title row + tabs together (The client 2026-07-15:
+              "it should just be the whole thing"). */}
+          <div className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200">
+            <Header
+              data={data}
+              watchlistSize={liveWatchCount}
+              loadFromFile={loadFromFile}
+              error={loadError}
+              addByLookup={addByLookup}
+            />
+            <div className="max-w-4xl w-full mx-auto px-4">
+              <Tabs
+                tab={tab}
+                setTab={setTab}
+                watchlistSize={liveWatchCount}
+              />
+            </div>
+          </div>
+          <div className="max-w-4xl w-full mx-auto px-4 pb-24 flex-1">
+            {tab !== "watchlist" && tab !== "top_value" && tab !== "gd_list" && tab !== "purchases" && (
+              <TimeWindowChips windowId={windowId} setWindowId={setWindowId} />
+            )}
+            {tab !== "top_value" && tab !== "gd_list" && tab !== "purchases" && (
+              <SubFilters
+                search={search} setSearch={setSearch}
+                theme={theme} setTheme={setTheme}
+                typeFilter={typeFilter} setTypeFilter={setTypeFilter}
+                sortBy={sortBy} setSortBy={setSortBy}
+                themes={allThemes}
+                total={visibleRows.length}
+                visible={visible.length}
+              />
+            )}
+            {tab === "purchases" ? (
+              <PurchasesView />
+            ) : tab === "gd_list" ? (
+              <GDListView
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                onClick={setSelected}
+              />
+            ) : tab === "top_value" ? (
+              <TopValueView
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                onClick={setSelected}
+              />
+            ) : tab === "watchlist" ? (
+              <WatchlistView
+                ebValues={ebValues}
+                liveValues={liveValues}
+                toggleNotify={toggleNotify}
+                buyingIds={buyingIds}
+                rows={visible}
+                now={now}
+                endedListingIds={endedListingIds}
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                onClick={setSelected}
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                buyNow={buyNow}
+                freshLookups={freshLookups}
+                refreshWatchlist={() => refreshWatchlist({ force: true })}
+                refreshing={refreshingWatchlist}
+              />
+            ) : (
+              <CardList
+                rows={visible}
+                now={now}
+                endedListingIds={endedListingIds}
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                onClick={setSelected}
+                tab={tab}
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                toggleNotify={toggleNotify}
+                buyNow={buyNow}
+                buyingIds={buyingIds}
+                ebValues={ebValues}
+                liveValues={liveValues}
+              />
+            )}
+            {tab !== "top_value" && tab !== "gd_list" && tab !== "purchases" && visibleRows.length > visible.length && (
+              <div className="text-center py-4">
+                <button
+                  onClick={() => setPageSize(n => n + 50)}
+                  className="text-sm text-slate-700 underline hover:text-slate-900"
+                >
+                  Load more ({visibleRows.length - visible.length} more)
+                </button>
+              </div>
+            )}
+            {tab !== "top_value" && tab !== "gd_list" && tab !== "purchases" && visibleRows.length === 0 && (
+              <EmptyTab tab={tab} hasFilters={!!(search || theme !== "all")} />
+            )}
+            {tab !== "watchlist" && tab !== "top_value" && tab !== "gd_list" && tab !== "purchases" && search.trim().length >= 3 && (
+              <FullInventorySearch
+                query={search.trim().toLowerCase()}
+                localHits={visibleRows.length}
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+              />
+            )}
+          </div>
+          {selected && (
+            <DetailDrawer
+              listing={selected}
+              sig={selected ? ebValues.get(selected.domain) : null}
+              onClose={() => setSelected(null)}
+              isWatched={watchlist.has(selected.listing_id)}
+              toggleWatch={() => toggleWatch(selected)}
+              now={now}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty state (no data yet)
+    // -----------------------------------------------------------------------
+
+    function EmptyState({ loadFromFile, loadFromUrl, error }) {
+      const fileRef = useRef(null);
+      const [url, setUrl] = useState("");
+      return (
+        <div className="min-h-screen flex items-center justify-center px-4">
+          <div className="max-w-md text-center">
+            <div className="text-3xl font-semibold mb-2">Auction Sniper</div>
+            <div className="text-slate-600 mb-6">Load a scored sync JSON to get started.</div>
+            <button
+              onClick={() => fileRef.current?.click()}
+              className="bg-slate-900 text-white px-5 py-3 rounded-lg hover:bg-slate-800 transition"
+            >
+              Choose a JSON file…
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={e => e.target.files?.[0] && loadFromFile(e.target.files[0])}
+            />
+            <div className="mt-6 text-sm text-slate-500">or load from URL:</div>
+            <div className="mt-2 flex gap-2">
+              <input
+                type="text"
+                placeholder="https://… or ./scored_expiring.json"
+                value={url}
+                onChange={e => setUrl(e.target.value)}
+                className="flex-1 px-3 py-2 border rounded-md text-sm"
+              />
+              <button
+                onClick={() => url && loadFromUrl(url)}
+                className="px-3 py-2 bg-slate-200 rounded-md text-sm hover:bg-slate-300"
+              >
+                Load
+              </button>
+            </div>
+            {error && (
+              <div className="mt-4 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                {error}
+              </div>
+            )}
+            <div className="mt-8 text-xs text-slate-400">
+              Expected file: <span data-monospace>data/scored_expiring.json</span> (auto-loaded if served from project root).
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Header
+    // -----------------------------------------------------------------------
+
+    function Header({ data, watchlistSize, loadFromFile, error, addByLookup }) {
+      const fileRef = useRef(null);
+      const generatedAt = data.generated_at ? new Date(data.generated_at) : null;
+      const staleHours = generatedAt ? (Date.now() - generatedAt.getTime()) / 3600000 : 0;
+      const isStale = staleHours > 26;  // more than ~1 day old
+      return (
+        // Stickiness handled by the wrapper in App (single unit with the
+        // tabs — two separate sticky bars fought each other, 2026-07-15).
+        <header>
+          <div className="max-w-4xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
+            <div className="flex items-baseline gap-3">
+              <div className="text-lg font-semibold">Auction Sniper</div>
+              <EnginePulse />
+              <div className="text-xs text-slate-500 hidden md:block">
+                <span data-monospace>{data.target}</span> · {data.total_listings.toLocaleString()} scored
+              </div>
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              {isStale && (
+                <span className="px-2 py-1 bg-amber-50 text-amber-800 border border-amber-300 rounded">
+                  Data {Math.round(staleHours)}h old
+                </span>
+              )}
+              {watchlistSize > 0 && (
+                <span className="px-2 py-1 bg-amber-50 text-amber-900 border border-amber-200 rounded">
+                  ★ {watchlistSize}
+                </span>
+              )}
+              {addByLookup && (
+                <button
+                  onClick={addByLookup}
+                  className="px-3 py-1 border rounded-md hover:bg-slate-50 font-medium"
+                  title="Look up any domain on GoDaddy and add it to your watchlist"
+                >
+                  + Add domain
+                </button>
+              )}
+              <button
+                onClick={() => fileRef.current?.click()}
+                className="px-3 py-1 border rounded-md hover:bg-slate-50"
+              >
+                Load…
+              </button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                onChange={e => e.target.files?.[0] && loadFromFile(e.target.files[0])}
+              />
+            </div>
+          </div>
+          {error && (
+            <div className="bg-rose-50 border-t border-rose-200 text-sm text-rose-800 px-4 py-2">
+              {error}
+            </div>
+          )}
+        </header>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabs
+    // -----------------------------------------------------------------------
+
+    function Tabs({ tab, setTab, watchlistSize }) {
+      const items = [
+        { id: "closing_soon", label: "Closing Soon" },
+        { id: "top_rated",    label: "Top Rated" },
+        { id: "top_value",    label: "Top Value" },
+        { id: "gd_list",      label: "GD List" },
+        { id: "purchases",    label: "Purchases" },
+        { id: "watchlist",    label: `Watchlist${watchlistSize > 0 ? ` (${watchlistSize})` : ""}` },
+      ];
+      return (
+        <div className="border-b border-slate-200 mt-4 mb-3 flex gap-6">
+          {items.map(it => (
+            <button
+              key={it.id}
+              onClick={() => setTab(it.id)}
+              className={`pb-2 text-sm transition border-b-2 ${
+                tab === it.id
+                  ? "border-slate-900 text-slate-900 font-semibold"
+                  : "border-transparent text-slate-500 hover:text-slate-900"
+              }`}
+            >
+              {it.label}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Time-window chips (only shown on Closing Soon tab)
+    // -----------------------------------------------------------------------
+
+    function TimeWindowChips({ windowId, setWindowId }) {
+      return (
+        <div className="mb-3 flex gap-2 flex-wrap">
+          {TIME_WINDOWS.map(w => (
+            <button
+              key={w.id}
+              onClick={() => setWindowId(w.id)}
+              className={`text-xs px-3 py-1.5 rounded-full border transition ${
+                windowId === w.id
+                  ? "bg-slate-900 text-white border-slate-900"
+                  : "bg-white text-slate-700 hover:bg-slate-50 border-slate-200"
+              }`}
+            >
+              {w.label}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Search + theme dropdown row
+    // -----------------------------------------------------------------------
+
+    function SubFilters({ search, setSearch, theme, setTheme, themes, total, visible, sortBy, setSortBy, typeFilter, setTypeFilter }) {
+      return (
+        <div className="flex flex-col md:flex-row gap-2 mb-3">
+          <input
+            type="search"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search domain…"
+            className="flex-1 px-3 py-2 border rounded-md text-sm bg-white"
+          />
+          <select
+            value={typeFilter || "all"}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="px-3 py-2 border rounded-md text-sm bg-white"
+            title="Auction type"
+          >
+            <option value="all">Bid + Buy Now</option>
+            <option value="EXPIRY_AUCTION">Bid only</option>
+            <option value="CLOSEOUT">Buy Now only</option>
+          </select>
+          <select
+            value={theme}
+            onChange={e => setTheme(e.target.value)}
+            className="px-3 py-2 border rounded-md text-sm bg-white"
+          >
+            <option value="all">All themes</option>
+            {themes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <select
+            value={sortBy || "default"}
+            onChange={e => setSortBy(e.target.value)}
+            className="px-3 py-2 border rounded-md text-sm bg-white"
+            title="Sort by"
+          >
+            <option value="default">Sort: default</option>
+            <option value="gd_value">Sort: GD value ↓</option>
+            <option value="score">Sort: Score ↓</option>
+            <option value="end_time">Sort: Ending soon ↑</option>
+            <option value="current_price">Sort: Cheapest ↑</option>
+            <option value="bid_count">Sort: Most bids ↓</option>
+          </select>
+          <div className="text-xs text-slate-500 self-center px-1">
+            {visible.toLocaleString()} of {total.toLocaleString()}
+          </div>
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-inventory search ("why can't I find poly?" — the client, 2026-07-11)
+    // -----------------------------------------------------------------------
+    // The main search box filters the day's top-5,000 scored listings. This
+    // component searches ALL ~935k listings via the backend index. Results
+    // carry REAL listing ids, so starred hits are fully snipeable.
+
+    async function apiSearchAll(q) {
+      try {
+        const r = await apiFetch(`/api/search?q=${encodeURIComponent(q)}&limit=50`);
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) return { error: body.detail || `Search failed (HTTP ${r.status})` };
+        return body;
+      } catch (e) {
+        return { error: String(e) };
+      }
+    }
+
+    function FullInventorySearch({ query, localHits, watchlist, toggleWatch }) {
+      const [state, setState] = useState({ phase: "idle", results: null, error: null, forQuery: null });
+
+      // Reset when the query changes so stale results don't linger.
+      useEffect(() => {
+        setState({ phase: "idle", results: null, error: null, forQuery: null });
+      }, [query]);
+
+      const run = async () => {
+        setState({ phase: "loading", results: null, error: null, forQuery: query });
+        const body = await apiSearchAll(query);
+        if (body.error) {
+          setState({ phase: "error", results: null, error: body.error, forQuery: query });
+          return;
+        }
+        let results = body.results || [];
+        // Exact-domain queries (2026-08-18: "the exact domain needs to just
+        // be in search"): if the query looks like a full domain and the
+        // index didn't have it, ask GoDaddy live and surface it on top.
+        if (query.includes(".") && !results.some(r => r.domain === query)) {
+          const live = await apiLookupDomain(query);
+          if (live && live.found) {
+            results = [{
+              domain: live.domain || query,
+              listing_id: live.listing_id || Date.now(),  // backend heals shims
+              auction_type: live.auction_type || "EXPIRY_AUCTION",
+              price: live.current_price_dollars != null ? String(live.current_price_dollars) : null,
+              valuation: live.estimated_value_dollars != null ? String(live.estimated_value_dollars) : null,
+              end_time_utc: live.end_time_utc,
+              bid_count: live.bid_count || 0,
+            }, ...results];
+          }
+        }
+        // Live truth overlay (2026-08-25 buildultra: the index said ended,
+        // GoDaddy said $5). One bulk availability call per search run.
+        if (results.length > 0) {
+          const liveMap = await apiLiveBatch(results.slice(0, 50).map(r => r.domain));
+          if (liveMap) {
+            results = results.map(r => {
+              const lv = liveMap[r.domain];
+              if (!lv) return r;
+              const avail = lv.status === "AVAILABLE";
+              return {
+                ...r,
+                _live: lv,
+                price: avail && lv.price != null ? lv.price : r.price,
+                end_time_utc: avail && lv.end_time_utc ? lv.end_time_utc : r.end_time_utc,
+              };
+            });
+          }
+        }
+        setState({ phase: "done", results, error: null, forQuery: query });
+      };
+
+      const starShape = (r) => ({
+        // Shape matches what apiAddWatchlist expects from a feed listing.
+        listing_id: r.listing_id,
+        domain: r.domain,
+        auction_type: r.auction_type,
+        current_price: r.price,
+        estimated_value: r.valuation,
+        end_time_utc: r.end_time_utc,
+        bid_count: r.bid_count || 0,
+        has_bids: (r.bid_count || 0) > 0,
+      });
+
+      return (
+        <div className="mt-6 mb-2">
+          {state.phase === "idle" && (
+            <div className="text-center">
+              <button
+                onClick={run}
+                className="text-sm px-3 py-2 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 font-medium"
+              >
+                {query.includes(".")
+                  ? <>Look up "{query}" on GoDaddy (exact + similar)</>
+                  : localHits === 0
+                    ? <>No matches in today's top list — search ALL of GoDaddy for "{query}"</>
+                    : <>Search ALL 935k GoDaddy listings for "{query}"</>}
+              </button>
+            </div>
+          )}
+          {state.phase === "loading" && (
+            <div className="text-center text-sm text-slate-500 py-3">Searching the full inventory…</div>
+          )}
+          {state.phase === "error" && (
+            <div className="text-center text-sm text-amber-700 py-3">{state.error}</div>
+          )}
+          {state.phase === "done" && (
+            <>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1.5">
+                Full inventory · {state.results.length} match{state.results.length === 1 ? "" : "es"} for "{state.forQuery}"
+                {state.results.length >= 50 ? " (first 50)" : ""}
+              </div>
+              {state.results.length === 0 ? (
+                <div className="text-center text-sm text-slate-500 py-3">
+                  Nothing containing "{state.forQuery}" in any current GoDaddy auction.
+                </div>
+              ) : (
+                <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+                  {state.results.map((r, i) => (
+                    <div
+                      key={r.listing_id}
+                      className={`flex items-center gap-3 px-4 py-2.5 ${i === state.results.length - 1 ? "" : "border-b border-slate-100"}`}
+                    >
+                      <button
+                        onClick={() => toggleWatch(starShape(r))}
+                        aria-label={watchlist.has(r.listing_id) ? "Remove from watchlist" : "Add to watchlist"}
+                        className={`text-lg flex-shrink-0 ${watchlist.has(r.listing_id) ? "text-amber-500" : "text-slate-300 hover:text-amber-400"}`}
+                      >
+                        {watchlist.has(r.listing_id) ? "★" : "☆"}
+                      </button>
+                      <BidTypeBadge auctionType={(r._live && r._live.status === "AVAILABLE" && liveEffectiveType(r._live)) || r.auction_type} />
+                      <div className="font-semibold truncate" data-monospace>{r.domain}</div>
+                      {r._live && r._live.status === "AVAILABLE" && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-50 text-emerald-600 border-emerald-200 flex-shrink-0 font-semibold">LIVE</span>
+                      )}
+                      {r._live && r._live.status === "UNAVAILABLE" && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-50 text-rose-600 border-rose-200 flex-shrink-0 font-semibold">GONE</span>
+                      )}
+                      <div className="text-xs text-slate-500 flex-shrink-0 ml-auto flex items-center gap-2" data-monospace>
+                        {r.price != null && <span>{formatPrice(r.price)}</span>}
+                        {r.valuation != null && <span className="text-slate-400">· est {formatPrice(r.valuation)}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="text-[11px] text-slate-400 mt-1.5 text-center">
+                Star a result to watch it — full-inventory results aren't scored, but bids and Buy Now work normally.
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Top Value tab — the client's daily "top 1,500 by GoDaddy valuation" scan
+    // (2026-07-14 call). Pulls from the backend's full-inventory index, so
+    // it ranks ALL ~935k listings by GoDaddy's dollar estimate, independent
+    // of our scoring rubric. Results carry real listing ids (snipeable).
+    // An Estibot column joins once their API access is unblocked.
+    // -----------------------------------------------------------------------
+
+    async function apiTopValue(offset, typeFilter, hours) {
+      try {
+        const params = new URLSearchParams({ limit: "100", offset: String(offset) });
+        if (typeFilter && typeFilter !== "all") params.set("auction_type", typeFilter);
+        if (hours && hours !== "all") params.set("within_hours", String(hours));
+        const r = await apiFetch(`/api/search/top-value?${params}`);
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) return { error: body.detail || `Failed (HTTP ${r.status})` };
+        return body;
+      } catch (e) {
+        return { error: String(e) };
+      }
+    }
+
+    // Top Value results cache — switching tabs unmounts the view; without
+    // this, every visit refetched from the backend (latency fix).
+    const _topValueCache = new Map();  // typeFilter -> {at, rows}
+    const TOP_VALUE_CACHE_MS = 5 * 60 * 1000;
+
+    async function apiLiveBatch(domains, verifyDomains) {
+      // Live listing truth (The client 2026-08-23: "nothing feeds it
+      // continuously"). Bulk 50 via the official availability API.
+      // verifyDomains (2026-08-25 myhomebills lie-detector): watchlisted
+      // domains get an estimate-API cross-check server-side, because the
+      // availability endpoint said UNAVAILABLE while godaddy.com sold the
+      // domain at $5. Keep this list to starred domains only.
+      try {
+        let url = `/api/search/live?d=${encodeURIComponent(domains.join(","))}`;
+        if (verifyDomains && verifyDomains.length > 0) {
+          url += `&verify=${encodeURIComponent(verifyDomains.join(","))}`;
+        }
+        const r = await apiFetch(url);
+        if (!r.ok) return null;
+        const body = await r.json().catch(() => null);
+        return body && body.live ? body.live : null;
+      } catch { return null; }
+    }
+
+    async function apiEstibotBatch(domains) {
+      // 2026-08-19: upgraded to the /signals endpoint — same batching, but
+      // each domain now carries { estibot, indexed_pages, exact_match_tlds,
+      // developed_tlds, renewal_est } for the cards and detail popup.
+      try {
+        const r = await apiFetch(`/api/search/signals?d=${encodeURIComponent(domains.join(","))}`);
+        if (!r.ok) return null;
+        const body = await r.json().catch(() => null);
+        return body && body.signals ? body.signals : null;
+      } catch { return null; }
+    }
+
+    // Time windows for Top Value (The client 2026-07-15: "the most urgent are
+    // the ones expiring sooner than later").
+    const TOP_VALUE_WINDOWS = [
+      { id: "1",   label: "1h" },
+      { id: "11",  label: "11h" },
+      { id: "24",  label: "1 day" },
+      { id: "48",  label: "2 days" },
+      { id: "72",  label: "3 days" },
+      { id: "168", label: "7 days" },
+      { id: "all", label: "All" },
+    ];
+
+    async function apiPurchases() {
+      try {
+        const r = await apiFetch(`/api/purchases?limit=100`);
+        if (!r.ok) return null;
+        return await r.json().catch(() => null);
+      } catch { return null; }
+    }
+
+    const OUTCOME_STYLE = {
+      won:       "bg-emerald-50 text-emerald-700 border-emerald-300",
+      dry_run:   "bg-slate-50 text-slate-500 border-slate-200",
+      in_flight: "bg-amber-50 text-amber-700 border-amber-300",
+      outbid:    "bg-sky-50 text-sky-700 border-sky-200",
+      lost:      "bg-rose-50 text-rose-600 border-rose-200",
+      error:     "bg-rose-50 text-rose-700 border-rose-300",
+      expired:   "bg-slate-50 text-slate-400 border-slate-200",
+    };
+
+    function PurchasesView() {
+      const [rows, setRows] = useState(null);
+      const [error, setError] = useState(false);
+      useEffect(() => {
+        (async () => {
+          const r = await apiPurchases();
+          if (r) setRows(r); else setError(true);
+        })();
+      }, []);
+      if (error) return <div className="text-center text-sm text-amber-700 py-8">Couldn't load purchases — check your connection.</div>;
+      if (rows == null) return <div className="text-center text-sm text-slate-500 py-8">Loading purchase history…</div>;
+      if (rows.length === 0) return <div className="text-center text-sm text-slate-500 py-8">No purchase attempts yet — the ledger fills as bids and buys fire.</div>;
+      return (
+        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+          {rows.map((p, i) => (
+            <div key={p.id} className={`px-4 py-3 ${i === rows.length - 1 ? "" : "border-b border-slate-100"}`}>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${OUTCOME_STYLE[p.outcome] || OUTCOME_STYLE.expired}`}>
+                  {p.outcome.replace("_", " ")}
+                </span>
+                <span className="text-[10px] text-slate-400 uppercase">{p.action_type === "CLOSEOUT_BUY" ? "Buy Now" : "Bid"}</span>
+                <span className="font-semibold" data-monospace>{p.domain}</span>
+                <span className="font-medium text-slate-800" data-monospace>{formatPrice(p.amount_dollars)}</span>
+                <span className="text-xs text-slate-400 ml-auto" data-monospace>
+                  {new Date(p.fired_at).toLocaleString()}
+                </span>
+              </div>
+              {(p.godaddy_order_id || p.detail) && (
+                <div className="text-[11px] text-slate-500 mt-1" data-monospace>
+                  {p.godaddy_order_id && <>Order {p.godaddy_order_id} · </>}
+                  {p.detail}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // Inline max-bid chip for list rows (2026-09-24 the client call: starring
+    // in Top Value / GD List gave no way to set the bid without hopping to
+    // the watchlist tab). Same rules as the Card: unknown != absent — show
+    // "loading bid…" until the entry detail is confirmed, never "+ max bid".
+    function RowMaxBidChip({ listingId, auctionType, watchlist, entryDetails, editMaxBid }) {
+      if (!editMaxBid || !watchlist.has(listingId)) return null;
+      const det = entryDetails?.get(listingId);
+      if (!det) {
+        return (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-slate-50 text-slate-400 border-slate-200 flex-shrink-0">
+            loading bid…
+          </span>
+        );
+      }
+      const isClose = auctionType === "CLOSEOUT";
+      const mb = det.max_bid_dollars;
+      return (
+        <button
+          onClick={(e) => { e.stopPropagation(); editMaxBid(listingId, auctionType); }}
+          aria-label="Set max bid"
+          className={`text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 font-medium transition ${
+            mb != null
+              ? "bg-indigo-50 text-indigo-900 border-indigo-200 hover:bg-indigo-100"
+              : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+          }`}
+        >
+          {isClose
+            ? (mb != null ? <>Auto-buy ≤ {formatPrice(mb)}</> : <>+ Set auto-buy</>)
+            : (mb != null ? <>Max {formatPrice(mb)}</> : <>+ Set max bid</>)}
+        </button>
+      );
+    }
+
+    function TopValueView({ watchlist, toggleWatch, entryDetails, editMaxBid, onClick }) {
+      const [typeFilter, setTypeFilter] = useState("all");
+      const [hours, setHours] = useState("all");
+      const now = useTick();
+      const cacheKey = typeFilter + "|" + hours;
+      const cached = _topValueCache.get(cacheKey);
+      const cacheFresh = cached && (Date.now() - cached.at) < TOP_VALUE_CACHE_MS;
+      const [rows, setRows] = useState(cacheFresh ? cached.rows : []);
+      const [phase, setPhase] = useState(cacheFresh ? "done" : "loading");
+      const [error, setError] = useState(null);
+
+      const load = async (offset, replace) => {
+        setPhase("loading");
+        const body = await apiTopValue(offset, typeFilter, hours);
+        if (body.error) {
+          setError(body.error);
+          setPhase("error");
+          return;
+        }
+        setRows(prev => {
+          const next = replace ? body.results : [...prev, ...body.results];
+          _topValueCache.set(cacheKey, { at: Date.now(), rows: next });
+          return next;
+        });
+        setPhase("done");
+      };
+
+      useEffect(() => {
+        const c = _topValueCache.get(cacheKey);
+        if (c && (Date.now() - c.at) < TOP_VALUE_CACHE_MS) {
+          setRows(c.rows);
+          setPhase("done");
+          return;
+        }
+        load(0, true);
+      }, [cacheKey]);
+
+      const starShape = (r) => ({
+        listing_id: r.listing_id,
+        domain: r.domain,
+        auction_type: r.auction_type,
+        current_price: r.price,
+        estimated_value: r.valuation,
+        end_time_utc: r.end_time_utc,
+        bid_count: r.bid_count || 0,
+        has_bids: (r.bid_count || 0) > 0,
+      });
+
+      // Live overlay (2026-08-26, "EVERYTHING NEEDS TO BE LIVE"): the index
+      // is up to 12h stale — sold rows lingered and prices lagged. Check
+      // the top 100 against the availability API on load and every 60s.
+      const [liveMap, setLiveMap] = useState(new Map());
+      useEffect(() => {
+        if (rows.length === 0) return;
+        let stop = false;
+        const check = async () => {
+          const doms = rows.slice(0, 100).map(r => r.domain).filter(Boolean);
+          for (let i = 0; i < doms.length; i += 50) {
+            if (stop) return;
+            const chunk = await apiLiveBatch(doms.slice(i, i + 50));
+            if (!chunk || stop) return;
+            setLiveMap(prev => {
+              const next = new Map(prev);
+              for (const [d, st] of Object.entries(chunk)) next.set(d, st);
+              return next;
+            });
+          }
+        };
+        check();
+        const iv = setInterval(check, 60000);
+        return () => { stop = true; clearInterval(iv); };
+      }, [rows]);
+
+      return (
+        <div>
+          <div className="mb-3 flex gap-2 flex-wrap">
+            {TOP_VALUE_WINDOWS.map(w => (
+              <button
+                key={w.id}
+                onClick={() => setHours(w.id)}
+                className={`text-xs px-3 py-1.5 rounded-full border transition ${
+                  hours === w.id
+                    ? "bg-slate-900 text-white border-slate-900"
+                    : "bg-white text-slate-700 hover:bg-slate-50 border-slate-200"
+                }`}
+              >
+                {w.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-xs text-slate-500">
+              All 935k listings ranked by GoDaddy valuation · EB = Estibot (amber = $1k+)
+            </div>
+            <select
+              value={typeFilter}
+              onChange={e => setTypeFilter(e.target.value)}
+              className="text-xs px-2 py-1.5 border rounded-md bg-white"
+            >
+              <option value="all">Bid + Buy Now</option>
+              <option value="EXPIRY_AUCTION">Bid only</option>
+              <option value="CLOSEOUT">Buy Now only</option>
+            </select>
+          </div>
+          {phase === "error" && (
+            <div className="text-center text-sm text-amber-700 py-6">{error}</div>
+          )}
+          {rows.length > 0 && (
+            <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+              {rows.map((r, i) => {
+                const lv = liveMap.get(r.domain);
+                const isGone = lv && lv.status === "UNAVAILABLE";
+                const livePrice = lv && lv.status === "AVAILABLE" && lv.price != null ? lv.price : r.price;
+                // Live end time beats the index's (rung changes, extensions).
+                const endIso = (lv && lv.status === "AVAILABLE" && lv.end_time_utc) ? lv.end_time_utc : r.end_time_utc;
+                const endMs = endIso ? new Date(endIso).getTime() : null;
+                const remainingMs = endMs != null ? endMs - now : null;
+                // GoDaddy's ACTUAL renewal price rides along on the live check.
+                const renewal = lv && lv.renewal != null ? lv.renewal : null;
+                // Live type beats the index (cookent: index said Buy Now,
+                // live said BID). Price evidence beats the label (dellport:
+                // $50 buy-now under an "expiry" listingType). Stored on
+                // star -> correct worker routing.
+                const liveType = (lv && lv.status === "AVAILABLE")
+                  ? liveEffectiveType(lv) : null;
+                const rShape = {
+                  ...starShape(r),
+                  auction_type: liveType || r.auction_type,
+                  current_price: livePrice,
+                  end_time_utc: endIso,
+                };
+                return (
+                <div
+                  key={r.listing_id}
+                  onClick={() => onClick && onClick(rShape)}
+                  className={`flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-slate-50 transition ${isGone ? "opacity-50" : ""} ${i === rows.length - 1 ? "" : "border-b border-slate-100"}`}
+                >
+                  <span className="text-[10px] text-slate-400 w-7 text-right flex-shrink-0" data-monospace>{i + 1}</span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); toggleWatch(rShape); }}
+                    aria-label={watchlist.has(r.listing_id) ? "Remove from watchlist" : "Add to watchlist"}
+                    className={`text-lg flex-shrink-0 ${watchlist.has(r.listing_id) ? "text-amber-500" : "text-slate-300 hover:text-amber-400"}`}
+                  >
+                    {watchlist.has(r.listing_id) ? "★" : "☆"}
+                  </button>
+                  <BidTypeBadge auctionType={liveType || r.auction_type} />
+                  <div className="font-semibold truncate" data-monospace>{r.domain}</div>
+                  <RowMaxBidChip listingId={r.listing_id} auctionType={liveType || r.auction_type}
+                    watchlist={watchlist} entryDetails={entryDetails} editMaxBid={editMaxBid} />
+                  {lv && lv.already_bidding && !isGone && (
+                    <span title={`You already have a bid on GoDaddy (${lv.member_bidding_status || "bidding"}). The sniper will not fire on this.`}
+                      className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-100 text-rose-700 border-rose-400 flex-shrink-0 font-bold">⚠ YOUR BID</span>
+                  )}
+                  {isGone && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-50 text-rose-600 border-rose-200 flex-shrink-0 font-semibold">GONE</span>
+                  )}
+                  <div className="text-xs flex-shrink-0 ml-auto flex items-center gap-2" data-monospace>
+                    <span className="text-emerald-500">GD est <span className="font-semibold text-emerald-600">{formatPrice(r.valuation)}</span></span>
+                    {r.estibot_value != null && (
+                      // The client's rule (2026-07-14 call): Estibot >= $1,000
+                      // is a flag worth attention — he can resell on the
+                      // strength of the Estibot number alone.
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                        Number(r.estibot_value) >= 1000
+                          ? "bg-amber-50 text-amber-800 border-amber-300 font-semibold"
+                          : "bg-slate-50 text-slate-500 border-slate-200"
+                      }`}>
+                        EB {formatPrice(r.estibot_value)}
+                      </span>
+                    )}
+                    {livePrice != null && !isGone && <span className="text-slate-500">· {formatPrice(livePrice)} now</span>}
+                    {/* renewal dropped from the main line 2026-09-24 (drawer still has it) */}
+                    {(r.bid_count || 0) > 0 && !isGone && <span className="text-slate-400">· {r.bid_count} bids</span>}
+                    {remainingMs != null && remainingMs > 0 && !isGone && (
+                      <span className={`font-medium ${urgencyClass(remainingMs)}`}>· {formatRemaining(remainingMs)}</span>
+                    )}
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+          )}
+          {phase === "loading" && (
+            <div className="text-center text-sm text-slate-500 py-6">Loading highest valuations…</div>
+          )}
+          {phase === "done" && rows.length > 0 && rows.length < 1500 && (
+            <div className="text-center py-4">
+              <button
+                onClick={() => load(rows.length, false)}
+                className="text-sm text-slate-700 underline hover:text-slate-900"
+              >
+                Load more (showing {rows.length})
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // GD List tab — GoDaddy's expiring list, mirrored exactly (The client,
+    // 2026-09-19 call). His hour-a-day ritual runs on GoDaddy's raw list in
+    // end-time order; the sniper's curated views made him feel he was
+    // missing 90-95% of what he'd bid on (dentl.com never surfaced). This
+    // tab is that list — every domain, no scoring, no floors, no allowlist —
+    // with his trusted columns alongside: GD est, Estibot, pages indexed.
+    // The day-range picker is the isolation GoDaddy can't do ("only day 3
+    // to day 4 — I already combed the earlier days").
+    // -----------------------------------------------------------------------
+
+    async function apiGdList(offset, typeFilter, fromH, toH) {
+      try {
+        const params = new URLSearchParams({ limit: "100", offset: String(offset), from_hours: String(fromH) });
+        if (toH != null) params.set("to_hours", String(toH));
+        if (typeFilter && typeFilter !== "all") params.set("auction_type", typeFilter);
+        const r = await apiFetch(`/api/search/gd-list?${params}`);
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) return { error: body.detail || `Failed (HTTP ${r.status})` };
+        return body;
+      } catch (e) { return { error: String(e) }; }
+    }
+
+    const GD_LIST_PRESETS = [
+      { id: "1h",  label: "1h",     from: 0, to: 1 },
+      { id: "11h", label: "11h",    from: 0, to: 11 },
+      { id: "1d",  label: "1 day",  from: 0, to: 24 },
+      { id: "2d",  label: "2 days", from: 0, to: 48 },
+      { id: "3d",  label: "3 days", from: 0, to: 72 },
+      { id: "7d",  label: "7 days", from: 0, to: 168 },
+      { id: "all", label: "All",    from: 0, to: null },
+    ];
+
+    function GDListView({ watchlist, toggleWatch, entryDetails, editMaxBid, onClick }) {
+      const [typeFilter, setTypeFilter] = useState("all");
+      const [preset, setPreset] = useState("1d");
+      // Custom day range (The client's plane workflow): day 3 -> day 4 means
+      // from_hours=72, to_hours=96. Empty = presets rule.
+      const [dayFrom, setDayFrom] = useState("");
+      const [dayTo, setDayTo] = useState("");
+      const [applied, setApplied] = useState(null);  // {from, to} hours when custom active
+      const now = useTick();
+      const [rows, setRows] = useState([]);
+      const [phase, setPhase] = useState("loading");
+      const [error, setError] = useState(null);
+      const [spMap, setSpMap] = useState(new Map());
+
+      const range = applied || (() => {
+        const p = GD_LIST_PRESETS.find(x => x.id === preset) || GD_LIST_PRESETS[2];
+        return { from: p.from, to: p.to };
+      })();
+
+      const load = async (offset, replace) => {
+        setPhase("loading");
+        const body = await apiGdList(offset, typeFilter, range.from, range.to);
+        if (body.error) { setError(body.error); setPhase("error"); return; }
+        const incoming = body.results || [];
+        setRows(prev => replace ? incoming : [...prev, ...incoming]);
+        setPhase("done");
+        // SP flags for the new slice (batch through /signals).
+        const doms = incoming.map(r => r.domain).filter(Boolean);
+        for (let i = 0; i < doms.length; i += 200) {
+          const sig = await apiEstibotBatch(doms.slice(i, i + 200));
+          if (!sig) continue;
+          setSpMap(prev => {
+            const next = new Map(prev);
+            for (const [d, s] of Object.entries(sig)) if (s && s.sp) next.set(d, s.sp);
+            return next;
+          });
+        }
+      };
+
+      useEffect(() => { load(0, true); }, [typeFilter, preset, applied]);
+
+      // Live overlay — same 60s truth as everywhere else.
+      const [liveMap, setLiveMap] = useState(new Map());
+      useEffect(() => {
+        if (rows.length === 0) return;
+        let stop = false;
+        const check = async () => {
+          const doms = rows.slice(0, 100).map(r => r.domain).filter(Boolean);
+          for (let i = 0; i < doms.length; i += 50) {
+            if (stop) return;
+            const chunk = await apiLiveBatch(doms.slice(i, i + 50));
+            if (!chunk || stop) return;
+            setLiveMap(prev => {
+              const next = new Map(prev);
+              for (const [d, st] of Object.entries(chunk)) next.set(d, st);
+              return next;
+            });
+          }
+        };
+        check();
+        const iv = setInterval(check, 60000);
+        return () => { stop = true; clearInterval(iv); };
+      }, [rows]);
+
+      const applyDays = () => {
+        const f = parseFloat(dayFrom), t = parseFloat(dayTo);
+        if (isNaN(f) || isNaN(t) || f < 0 || t <= f) {
+          alert("Day range: 'from' must be 0 or more and 'to' must be after it. Example: from 3, to 4.");
+          return;
+        }
+        setApplied({ from: f * 24, to: t * 24 });
+      };
+
+      const starShape = (r, liveType, livePrice, endIso) => ({
+        listing_id: r.listing_id,
+        domain: r.domain,
+        auction_type: liveType || r.auction_type,
+        current_price: livePrice,
+        estimated_value: r.valuation,
+        end_time_utc: endIso,
+        bid_count: r.bid_count || 0,
+        has_bids: (r.bid_count || 0) > 0,
+      });
+
+      return (
+        <div>
+          <div className="mb-3 flex gap-2 flex-wrap items-center">
+            {GD_LIST_PRESETS.map(w => (
+              <button
+                key={w.id}
+                onClick={() => { setApplied(null); setPreset(w.id); }}
+                className={`text-xs px-3 py-1.5 rounded-full border transition ${
+                  !applied && preset === w.id
+                    ? "bg-slate-900 text-white border-slate-900"
+                    : "bg-white text-slate-700 hover:bg-slate-50 border-slate-200"
+                }`}
+              >
+                {w.label}
+              </button>
+            ))}
+            <span className="text-xs text-slate-400 ml-2">or day</span>
+            <input value={dayFrom} onChange={e => setDayFrom(e.target.value)} placeholder="3"
+              className={`w-12 text-xs px-2 py-1.5 border rounded-md ${applied ? "border-slate-900" : ""}`} />
+            <span className="text-xs text-slate-400">to</span>
+            <input value={dayTo} onChange={e => setDayTo(e.target.value)} placeholder="4"
+              className={`w-12 text-xs px-2 py-1.5 border rounded-md ${applied ? "border-slate-900" : ""}`} />
+            <button onClick={applyDays}
+              className={`text-xs px-3 py-1.5 rounded-md border font-medium ${
+                applied ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 hover:bg-slate-50 border-slate-200"
+              }`}>
+              Apply
+            </button>
+          </div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-xs text-slate-500">
+              GoDaddy's expiring list, mirrored — every domain, end-time order, no filters
+              {applied && <> · showing day {applied.from / 24} to day {applied.to / 24}</>}
+            </div>
+            <select
+              value={typeFilter}
+              onChange={e => setTypeFilter(e.target.value)}
+              className="text-xs px-2 py-1.5 border rounded-md bg-white"
+            >
+              <option value="all">Bid + Buy Now</option>
+              <option value="EXPIRY_AUCTION">Bid only</option>
+              <option value="CLOSEOUT">Buy Now only</option>
+            </select>
+          </div>
+          {phase === "error" && (
+            <div className="text-center text-sm text-amber-700 py-6">{error}</div>
+          )}
+          {rows.length > 0 && (
+            <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+              {rows.map((r, i) => {
+                const lv = liveMap.get(r.domain);
+                const isGone = lv && lv.status === "UNAVAILABLE";
+                const livePrice = lv && lv.status === "AVAILABLE" && lv.price != null ? lv.price : r.price;
+                const endIso = (lv && lv.status === "AVAILABLE" && lv.end_time_utc) ? lv.end_time_utc : r.end_time_utc;
+                const endMs = endIso ? new Date(endIso).getTime() : null;
+                const remainingMs = endMs != null ? endMs - now : null;
+                const liveType = (lv && lv.status === "AVAILABLE") ? liveEffectiveType(lv) : null;
+                const sp = spMap.get(r.domain);
+                const rShape = starShape(r, liveType, livePrice, endIso);
+                return (
+                <div
+                  key={`${r.listing_id}-${i}`}
+                  onClick={() => onClick && onClick(rShape)}
+                  className={`flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-slate-50 transition ${isGone ? "opacity-50" : ""} ${i === rows.length - 1 ? "" : "border-b border-slate-100"}`}
+                >
+                  <span className="text-[10px] text-slate-400 w-7 text-right flex-shrink-0" data-monospace>{i + 1}</span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); toggleWatch(rShape); }}
+                    aria-label={watchlist.has(r.listing_id) ? "Remove from watchlist" : "Add to watchlist"}
+                    className={`text-lg flex-shrink-0 ${watchlist.has(r.listing_id) ? "text-amber-500" : "text-slate-300 hover:text-amber-400"}`}
+                  >
+                    {watchlist.has(r.listing_id) ? "★" : "☆"}
+                  </button>
+                  <BidTypeBadge auctionType={liveType || r.auction_type} />
+                  <div className="font-semibold truncate" data-monospace>{r.domain}</div>
+                  <RowMaxBidChip listingId={r.listing_id} auctionType={liveType || r.auction_type}
+                    watchlist={watchlist} entryDetails={entryDetails} editMaxBid={editMaxBid} />
+                  {lv && lv.already_bidding && !isGone && (
+                    <span title={`You already have a bid on GoDaddy (${lv.member_bidding_status || "bidding"}). The sniper will not fire on this.`}
+                      className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-100 text-rose-700 border-rose-400 flex-shrink-0 font-bold">⚠ YOUR BID</span>
+                  )}
+                  {sp && (
+                    <span title={`Possible misspelling: ${sp}`} className="text-[10px] px-1.5 py-0.5 rounded border bg-orange-50 text-orange-700 border-orange-300 flex-shrink-0 font-bold">SP?</span>
+                  )}
+                  {isGone && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-50 text-rose-600 border-rose-200 flex-shrink-0 font-semibold">GONE</span>
+                  )}
+                  <div className="text-xs flex-shrink-0 ml-auto flex items-center gap-2" data-monospace>
+                    {r.valuation != null && (
+                      <span className="text-emerald-500">GD est <span className="font-semibold text-emerald-600">{formatPrice(r.valuation)}</span></span>
+                    )}
+                    {r.estibot_value != null && (
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                        Number(r.estibot_value) >= 1000
+                          ? "bg-amber-50 text-amber-800 border-amber-300 font-semibold"
+                          : "bg-slate-50 text-slate-500 border-slate-200"
+                      }`}>
+                        EB {formatPrice(r.estibot_value)}
+                      </span>
+                    )}
+                    {r.indexed_pages != null && <span className="text-slate-400">· {r.indexed_pages.toLocaleString()} pg</span>}
+                    {livePrice != null && !isGone && <span className="text-slate-500">· {formatPrice(livePrice)} now</span>}
+                    {(r.bid_count || 0) > 0 && !isGone && <span className="text-slate-400">· {r.bid_count} bids</span>}
+                    {remainingMs != null && remainingMs > 0 && !isGone && (
+                      <span className={`font-medium ${urgencyClass(remainingMs)}`}>· {formatRemaining(remainingMs)}</span>
+                    )}
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+          )}
+          {phase === "loading" && (
+            <div className="text-center text-sm text-slate-500 py-6">Loading GoDaddy's list…</div>
+          )}
+          {phase === "done" && rows.length === 0 && (
+            <div className="text-center text-sm text-slate-500 py-6">Nothing expiring in this window.</div>
+          )}
+          {phase === "done" && rows.length > 0 && (
+            <div className="text-center py-4">
+              <button
+                onClick={() => load(rows.length, false)}
+                className="text-sm text-slate-700 underline hover:text-slate-900"
+              >
+                Load more (showing {rows.length})
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Watchlist liveness classification
+    // -----------------------------------------------------------------------
+    // GoDaddy expiry auctions run at most 10 days. Anything on the watchlist
+    // showing a longer runway is NOT the auction the client starred — the domain
+    // ended and was relisted by its owner/a reseller (60-90 day seller
+    // listings with asking prices). Those, plus ended/not-found entries, get
+    // bucketed as "Old" and excluded from the live watchlist count.
+    const EXPIRY_WINDOW_MS = 10.5 * 24 * 3600 * 1000;  // 10 days + buffer
+
+    // Returns null if the row is a live, original auction; otherwise a short
+    // human-readable reason for why it's in the Old bucket.
+    function watchRowOldReason({ inFeed, fresh, endMs, now }) {
+      if (fresh && fresh.found === false) return "No longer in auction";
+      if (endMs != null && endMs <= now) return "Ended";
+      if (endMs != null && endMs - now > EXPIRY_WINDOW_MS) return "Relisted — not the original auction";
+      // No feed row and no lookup yet = freshly starred from full-inventory
+      // search. That's LIVE-until-proven-dead (it lands in Old only if the
+      // lookup comes back not-found), so it must not vanish into the Old
+      // bucket the moment the client stars it.
+      return null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Card list (the meat of the dashboard)
+    // -----------------------------------------------------------------------
+
+    // Watchlist tab gets its own renderer that splits Active vs Expired into
+    // two sub-sections so the client can review what he was watching that timed
+    // out (per a 5/29 review). Active items render exactly like other tabs;
+    // Expired items get a subtle visual treatment (lighter, "Expired" tag).
+    function WatchlistView({ rows, now, endedListingIds, watchlist, toggleWatch, onClick, entryDetails, editMaxBid, toggleNotify, buyNow, buyingIds, ebValues, liveValues, freshLookups, refreshWatchlist, refreshing }) {
+      // Merge fresh GoDaddy lookup data (refreshed on tab-open) over the
+      // static data-sync values. The client 2026-06-03: he was bidding live and
+      // our dashboard still showed yesterday's bid amount. The fresh data
+      // gives current_price + bid_count straight from GoDaddy.
+      const mergedRows = rows.map(L => {
+        const fresh = freshLookups?.get(L.listing_id);
+        if (!fresh) return L;
+        return {
+          ...L,
+          current_price: fresh.current_price != null
+            ? String(fresh.current_price)
+            : L.current_price,
+          bid_count: fresh.bid_count != null ? fresh.bid_count : L.bid_count,
+          has_bids: fresh.bid_count != null
+            ? fresh.bid_count > 0
+            : L.has_bids,
+          end_time_utc: fresh.end_time_utc || L.end_time_utc,
+          // GD-est fix (2026-07-15): the lookup returns GoDaddy's estimate;
+          // it was being dropped here, so Old/backend-only rows showed EB
+          // but no GD number (The client's demo confusion).
+          estimated_value: L.estimated_value != null ? L.estimated_value
+            : (fresh.estimated_value != null ? String(fresh.estimated_value) : null),
+          _fresh_refreshed_at: fresh.refreshed_at,
+        };
+      });
+
+      // Old section hidden by default (The client 2026-08-19: doesn't want to
+      // see expired watchlist items). One tap reveals them when needed.
+      const [showOld, setShowOld] = useState(false);
+      const active = [];
+      const armedWatches = [];
+      const expired = [];
+      for (const L of mergedRows) {
+        const endMs = L.end_time_utc ? new Date(L.end_time_utc).getTime() : null;
+        // 2026-08-25 (buildultra): GoDaddy's live answer beats every feed-
+        // derived "old" heuristic. AVAILABLE -> Live section, full stop —
+        // the Card overlay shows the current rung's price and countdown.
+        // Explicit UNAVAILABLE -> Old, even if the feed clock says active.
+        const lv = liveValues ? liveValues.get(L.domain) : null;
+        if (lv && lv.status === "AVAILABLE") {
+          active.push(L);
+          continue;
+        }
+        if (endedListingIds.has(L.listing_id)) {
+          active.push(L);  // mid fade-out animation; leave in place
+          continue;
+        }
+        const fresh = freshLookups?.get(L.listing_id);
+        const det = entryDetails ? entryDetails.get(L.listing_id) : null;
+        // Armed auto-buy on a CLOSEOUT = the worker is watching for the
+        // next rung of the price ladder. That earns its own section below
+        // Live. BID auctions don't ladder back (Adam 2026-08-26: "the auto
+        // buy armed waiting for come back is for buy nows that drop
+        // prices, not auctions") — a gone BID goes to Old, armed or not.
+        // CLOSEOUT rows qualify. Backend-only rows qualify ONLY if starred
+        // in the last 7 days: that's a fresh lapse waiting for its closeout
+        // conversion (finacredit pattern) — NOT June's dead BID entries,
+        // which flooding back into this section was this morning's bug.
+        const _detAgeMs = det && det.created_at ? (now - new Date(det.created_at).getTime()) : Infinity;
+        const armedWatch = !!(det && det.is_armed && det.max_bid_dollars != null && det.status === "pending")
+          && (L.auction_type === "CLOSEOUT" || (L._backend_only === true && _detAgeMs < 7 * 24 * 3600 * 1000));
+        const reason = watchRowOldReason({
+          inFeed: !L._backend_only,
+          fresh,
+          endMs,
+          now,
+        }) || (lv && lv.status === "UNAVAILABLE" ? "gone (live check)" : null);
+        if (reason) {
+          if (armedWatch) {
+            armedWatches.push({ ...L, _armed_watch: true });
+          } else {
+            expired.push({ ...L, _old_reason: reason });
+          }
+        } else if (L._backend_only && !fresh) {
+          // Not in today's feed and not verified yet. The client must NOT see
+          // a wall of "checking live status" spinners — only entries
+          // starred in the last 5 minutes earn a checking chip in Live;
+          // stale unknowns wait quietly behind "Show old" until a lookup
+          // or the live poll proves them alive.
+          // det can lag a beat right after starring (entryDetails refetch
+          // in flight). No det = brand-new by definition — treat as fresh,
+          // NOT ancient (2026-08-26 minecraftia: a just-starred Top Value
+          // domain landed in Old as "not live in feed" for one render).
+          const ageMs = det && det.created_at
+            ? (now - new Date(det.created_at).getTime())
+            : 0;
+          if (ageMs <= 5 * 60 * 1000) {
+            active.push({ ...L, _verifying: true });
+          } else {
+            expired.push({ ...L, _old_reason: "not live in feed" });
+          }
+        } else {
+          active.push(L);
+        }
+      }
+
+      // Most-recent refresh timestamp across all watched items.
+      const latestRefresh = Array.from(freshLookups?.values() || []).reduce(
+        (acc, v) => Math.max(acc, v.refreshed_at || 0),
+        0
+      );
+      const refreshAgeSec = latestRefresh
+        ? Math.floor((now - latestRefresh) / 1000)
+        : null;
+      // Expired sub-sort by recency (most recently ended first).
+      expired.sort((a, b) => {
+        const am = a.end_time_utc ? new Date(a.end_time_utc).getTime() : 0;
+        const bm = b.end_time_utc ? new Date(b.end_time_utc).getTime() : 0;
+        return bm - am;
+      });
+      return (
+        <>
+          {/* Refresh status bar — the client wants to see live GD state without leaving our app */}
+          {(active.length > 0 || expired.length > 0) && (
+            <div className="flex items-center justify-between mb-3 text-xs">
+              <div className="text-slate-500">
+                {latestRefresh > 0 ? (
+                  <>Live data from GoDaddy · refreshed {refreshAgeSec}s ago</>
+                ) : (
+                  <>Using cached data from last daily sync</>
+                )}
+              </div>
+              <button
+                onClick={refreshWatchlist}
+                disabled={refreshing}
+                className={`px-2 py-1 border rounded-md text-xs font-medium transition ${
+                  refreshing
+                    ? "bg-slate-100 text-slate-400 border-slate-200 cursor-wait"
+                    : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                }`}
+              >
+                {refreshing ? "Refreshing…" : "↻ Refresh"}
+              </button>
+            </div>
+          )}
+          {active.length > 0 && (
+            <>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1.5">
+                Live ({active.length})
+              </div>
+              <CardList
+                rows={active}
+                now={now}
+                endedListingIds={endedListingIds}
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                onClick={onClick}
+                tab="watchlist"
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                toggleNotify={toggleNotify}
+                buyNow={buyNow}
+                buyingIds={buyingIds}
+                ebValues={ebValues}
+                liveValues={liveValues}
+              />
+            </>
+          )}
+          {armedWatches.length > 0 && (
+            <>
+              <div className="text-[11px] uppercase tracking-wide text-amber-600 mt-6 mb-1.5">
+                Auto-buy watches — waiting for a price drop ({armedWatches.length})
+              </div>
+              <CardList
+                rows={armedWatches}
+                now={now}
+                endedListingIds={endedListingIds}
+                watchlist={watchlist}
+                toggleWatch={toggleWatch}
+                onClick={onClick}
+                tab="watchlist"
+                entryDetails={entryDetails}
+                editMaxBid={editMaxBid}
+                toggleNotify={toggleNotify}
+                buyNow={buyNow}
+                buyingIds={buyingIds}
+                ebValues={ebValues}
+                liveValues={liveValues}
+              />
+            </>
+          )}
+          {expired.length > 0 && !showOld && (
+            <div className="text-center mt-6">
+              <button
+                onClick={() => setShowOld(true)}
+                className="text-[11px] uppercase tracking-wide text-slate-400 hover:text-slate-600 underline"
+              >
+                Show old — ended or relisted ({expired.length})
+              </button>
+            </div>
+          )}
+          {expired.length > 0 && showOld && (
+            <>
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mt-6 mb-1.5">
+                Old — ended or relisted ({expired.length}) ·{" "}
+                <button onClick={() => setShowOld(false)} className="underline hover:text-slate-600">hide</button>
+              </div>
+              <div className="opacity-60">
+                <CardList
+                  rows={expired}
+                  now={now}
+                  endedListingIds={endedListingIds}
+                  watchlist={watchlist}
+                  toggleWatch={toggleWatch}
+                  onClick={onClick}
+                  tab="watchlist"
+                  entryDetails={entryDetails}
+                  editMaxBid={editMaxBid}
+                  toggleNotify={toggleNotify}
+                  buyNow={buyNow}
+                  buyingIds={buyingIds}
+                  ebValues={ebValues}
+                  liveValues={liveValues}
+                />
+              </div>
+            </>
+          )}
+          {active.length === 0 && armedWatches.length === 0 && expired.length === 0 && (
+            <div className="text-center py-16 text-slate-400 text-sm">
+              Your watchlist is empty. Click ☆ on any listing to add it.
+            </div>
+          )}
+        </>
+      );
+    }
+
+    function CardList({ rows, now, endedListingIds, watchlist, toggleWatch, onClick, tab, entryDetails, editMaxBid, toggleNotify, buyNow, buyingIds, ebValues, liveValues }) {
+      return (
+        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+          {rows.map((L, i) => (
+            <Card
+              key={L.listing_id}
+              listing={L}
+              now={now}
+              isEndingFade={endedListingIds.has(L.listing_id)}
+              isWatched={watchlist.has(L.listing_id)}
+              toggleWatch={(e) => { e.stopPropagation(); toggleWatch(L); }}
+              onClick={() => onClick(L)}
+              isLast={i === rows.length - 1}
+              tab={tab}
+              entryDetail={entryDetails?.get(L.listing_id)}
+              onEditMaxBid={editMaxBid ? (e) => { e.stopPropagation(); editMaxBid(L.listing_id, L.auction_type); } : null}
+              onToggleNotify={toggleNotify ? (e) => { e.stopPropagation(); toggleNotify(L.listing_id); } : null}
+              onBuyNow={buyNow ? (e) => { e.stopPropagation(); buyNow(L); } : null}
+              isBuying={buyingIds ? buyingIds.has(L.listing_id) : false}
+              ebValue={ebValues ? ebValues.get(L.domain) : null}
+              live={liveValues ? liveValues.get(L.domain) : null}
+            />
+          ))}
+        </div>
+      );
+    }
+
+    function BidTypeBadge({ auctionType }) {
+      // Per the client 5/28: visually differentiate Buy Now (closeout, instant
+      // action) from Current Bid (live auction). Green = closeout (act now);
+      // blue = expiring auction (bid escalation in progress).
+      if (auctionType === "CLOSEOUT") {
+        return (
+          <span className="inline-block text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 flex-shrink-0">
+            Buy Now
+          </span>
+        );
+      }
+      return (
+        <span className="inline-block text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200 flex-shrink-0">
+          Bid
+        </span>
+      );
+    }
+
+    function Card({ listing: rawListing, now, isEndingFade, isWatched, toggleWatch, onClick, isLast, tab, entryDetail, onEditMaxBid, onToggleNotify, onBuyNow, isBuying, ebValue, live }) {
+      // Live overlay (2026-08-25): the availability API is truth; the feed
+      // is yesterday. Replace price/end-time when live data exists, and
+      // tag sold/ended listings GONE.
+      const isGone = live && live.status === "UNAVAILABLE";
+      const listing = live && !isGone ? {
+        ...rawListing,
+        auction_type: liveEffectiveType(live) || rawListing.auction_type,
+        current_price: live.price != null ? live.price : rawListing.current_price,
+        end_time_utc: live.end_time_utc || rawListing.end_time_utc,
+        bid_count: live.bid_count != null ? live.bid_count : rawListing.bid_count,
+        has_bids: live.bid_count != null ? live.bid_count > 0 : rawListing.has_bids,
+      } : rawListing;
+      const endMs = listing.end_time_utc ? new Date(listing.end_time_utc).getTime() : null;
+      const remaining = endMs != null ? endMs - now : null;
+      const isClose = listing.auction_type === "CLOSEOUT";
+      const priceLabel = isClose ? "Buy Now" : "Current Bid";
+      // 2026-07-15 (The client demo): star-then-bid works from ANY tab now —
+      // the max-bid button appears on a card as soon as it's starred (the
+      // backend entry exists), no scroll back to Watchlist. Two-step
+      // safety preserved: no star, no bid button.
+      const showMaxBid = onEditMaxBid && (tab === "watchlist" || (isWatched && entryDetail));
+      const maxBidValue = entryDetail?.max_bid_dollars;
+      const isArmed = entryDetail?.is_armed;
+      const status = entryDetail?.status;
+      // Reminder bell. Same gate as the max-bid button: it needs a backend
+      // watchlist entry to hang the prefs off, which is exactly what
+      // `entryDetail` proves exists.
+      const showNotify = onToggleNotify && isWatched && entryDetail;
+      const notifyOn = !!entryDetail?.notify_enabled;
+      return (
+        <div
+          onClick={onClick}
+          className={`flex items-center gap-3 px-4 py-3 ${isLast ? "" : "border-b border-slate-100"} hover:bg-slate-50 cursor-pointer transition ${isEndingFade ? "ending-fade" : ""}`}
+        >
+          {/* Star + Buy Now (closeouts only) */}
+          <button
+            onClick={toggleWatch}
+            aria-label={isWatched ? "Remove from watchlist" : "Add to watchlist"}
+            className={`text-lg flex-shrink-0 ${isWatched ? "text-amber-500" : "text-slate-300 hover:text-amber-400"}`}
+          >
+            {isWatched ? "★" : "☆"}
+          </button>
+          {showNotify && (
+            <button
+              onClick={onToggleNotify}
+              aria-label={notifyOn ? "Turn off email reminders" : "Email me before this ends"}
+              aria-pressed={notifyOn}
+              title={notifyOn
+                ? "Email reminders ON — 24h, 12h, 3h and 30m before this ends"
+                : "Email me 24h, 12h, 3h and 30m before this ends"}
+              className={`flex-shrink-0 transition ${
+                notifyOn ? "text-indigo-600" : "text-slate-300 hover:text-indigo-400"
+              }`}
+            >
+              {/* Inline SVG rather than 🔔/🔕: emoji render in their own
+                  colors, so they can't show on/off state the way the
+                  star's ★/☆ does. currentColor picks up the classes above. */}
+              <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"
+                   fill={notifyOn ? "currentColor" : "none"}
+                   stroke="currentColor" strokeWidth="1.6"
+                   strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5c0 3.2-.9 4.7-1.6 5.5-.3.3-.1.9.4.9h11.4c.5 0 .7-.6.4-.9-.7-.8-1.6-2.3-1.6-5.5A4.5 4.5 0 0 0 10 2.5Z" />
+                <path d="M8.2 16.2a2 2 0 0 0 3.6 0" fill="none" />
+              </svg>
+            </button>
+          )}
+          {isClose && onBuyNow && (
+            <button
+              onClick={isBuying ? undefined : onBuyNow}
+              disabled={isBuying}
+              aria-label="Buy Now"
+              title={isBuying ? "Purchase in progress…" : `Buy ${listing.domain} now at ${formatPrice(listing.current_price)}`}
+              className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-1 rounded transition flex-shrink-0 ${
+                isBuying
+                  ? "bg-slate-300 text-slate-500 cursor-wait"
+                  : "bg-emerald-600 text-white hover:bg-emerald-700"
+              }`}
+            >
+              {isBuying ? "…" : "Buy"}
+            </button>
+          )}
+
+          {/* Main content -- two lines */}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-0.5">
+              <BidTypeBadge auctionType={listing.auction_type} />
+              <div className="font-semibold truncate" data-monospace>{listing.domain}</div>
+              {listing.score != null && (
+                <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 ${scoreColor(listing.score)}`}>
+                  {listing.score}
+                </span>
+              )}
+              {listing._verifying && (
+                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-sky-50 text-sky-600 border-sky-200">
+                  checking live status…
+                </span>
+              )}
+              {isGone && !listing._armed_watch && (
+                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-rose-50 text-rose-600 border-rose-200 font-semibold">
+                  GONE — sold or ended
+                </span>
+              )}
+              {live && live.watching && !isGone && (
+                <span title="On the GoDaddy-app watchlist" className="text-indigo-400 text-xs flex-shrink-0">🔔</span>
+              )}
+              {live && live.already_bidding && !isGone && (
+                // Self-bidding collision guard (2026-09-24, the client's #1 fear):
+                // GoDaddy says he already has a bid on this. The sniper will
+                // stand down rather than bid against himself — this flag makes
+                // that visible so nothing happens behind his back.
+                <span
+                  title={`You already have a bid on GoDaddy (${live.member_bidding_status || "bidding"}). The sniper will NOT fire on this to avoid raising your own price.`}
+                  className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-rose-100 text-rose-700 border-rose-400 font-bold"
+                >
+                  ⚠ YOU ALREADY HAVE A BID
+                </span>
+              )}
+              {ebValue != null && ebValue.sp != null && (
+                // The client's SP flag (2026-08-28, the $60 misspelled-domain
+                // lesson): this name is one typo away from a real word.
+                // Hover shows what it's probably supposed to be.
+                <span
+                  title={`Possible misspelling: ${ebValue.sp}`}
+                  className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-orange-50 text-orange-700 border-orange-300 font-bold"
+                >
+                  SP?
+                </span>
+              )}
+              {listing._armed_watch && (
+                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-amber-50 text-amber-700 border-amber-200 font-semibold">
+                  auto-buy armed — watching for comeback
+                </span>
+              )}
+              {listing._old_reason && (
+                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 bg-slate-50 text-slate-500 border-slate-200">
+                  {listing._old_reason}
+                </span>
+              )}
+            </div>
+            <div className="text-xs text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              <span><span className="text-slate-400">{priceLabel}:</span> <span className="font-medium text-slate-700" data-monospace>{formatPrice(listing.current_price)}</span></span>
+              {(listing.estimated_value || (ebValue && ebValue.gd_est)) && (
+                // Valuation colors (The client-readable at a glance):
+                // GD = light green, Estibot = indigo (amber when $1k+).
+                // Falls back to the full-index valuation when the feed row
+                // has none (2026-09-07 vlr.co: starred from search/Top
+                // Value, no feed data, GD est showed blank).
+                <span className="text-emerald-500" data-monospace>
+                  · GD est <span className="font-medium text-emerald-600">{formatPrice(listing.estimated_value || ebValue.gd_est)}</span>
+                </span>
+              )}
+              {ebValue != null && ebValue.estibot != null && (
+                // Estibot appraisal — deliberately a different color from
+                // the GD number so the client reads the two models at a glance:
+                // GD = green, Estibot = indigo, amber when $1k+ (his flag).
+                <span className={Number(ebValue.estibot) >= 1000
+                  ? "text-amber-700 font-semibold"
+                  : "text-indigo-600"} data-monospace>
+                  · EB <span className="font-semibold">{formatPrice(ebValue.estibot)}</span>
+                </span>
+              )}
+              {/* Renewal removed from the main line (2026-09-24 the client call:
+                  "extra junk" — his bulk rate is ~$10.47 regardless). It
+                  still shows in the detail drawer's Renewal (est.) row. */}
+              {(listing.bid_count || 0) > 0 ? (
+                <span className="text-slate-500">· {listing.bid_count} bids</span>
+              ) : listing.has_bids ? (
+                <span className="text-slate-500">· has bids</span>
+              ) : null}
+              {listing.tld_spread_checked && (
+                <span className="text-slate-500" data-monospace>
+                  · TLDs {listing.tld_spread_taken}/{listing.tld_spread_checked}
+                </span>
+              )}
+              {remaining != null && (
+                <span className={`font-medium ${urgencyClass(remaining)}`}>
+                  · {formatRemaining(remaining)}
+                </span>
+              )}
+            </div>
+            {/* Watchlist-only second row: max-bid display + edit.
+                2026-09-07: while entry details are still LOADING,
+                entryDetail is undefined — showing "+ Set max bid" there
+                told Adam five saved bids had vanished. Unknown != absent:
+                loading gets a quiet placeholder; the set-bid button only
+                renders once the backend has confirmed the real state. */}
+            {showMaxBid && !entryDetail && (
+              <div className="text-xs flex items-center gap-2 mt-1">
+                <span className="inline-flex items-center px-2 py-0.5 rounded border text-[11px] bg-slate-50 text-slate-400 border-slate-200">
+                  loading bid…
+                </span>
+              </div>
+            )}
+            {showMaxBid && entryDetail && (
+              <div className="text-xs flex items-center gap-2 mt-1">
+                <button
+                  onClick={onEditMaxBid}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-medium transition ${
+                    maxBidValue != null
+                      ? "bg-indigo-50 text-indigo-900 border-indigo-200 hover:bg-indigo-100"
+                      : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                  }`}
+                  aria-label="Set max bid"
+                >
+                  {isClose
+                    ? (maxBidValue != null
+                        ? <>Auto-buy at ≤ <span data-monospace>{formatPrice(maxBidValue)}</span></>
+                        : <>+ Set auto-buy price</>)
+                    : (maxBidValue != null
+                        ? <>Max bid: <span data-monospace>{formatPrice(maxBidValue)}</span></>
+                        : <>+ Set max bid</>)
+                  }
+                </button>
+                {status && status !== "pending" && (
+                  <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                    {status}
+                  </span>
+                )}
+                {isArmed === false && (
+                  <span className="text-[10px] uppercase tracking-wide text-rose-600">
+                    disarmed
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty-tab message
+    // -----------------------------------------------------------------------
+
+    function EmptyTab({ tab, hasFilters }) {
+      const messages = {
+        closing_soon: hasFilters
+          ? "No closing-soon items match your filters. Try widening the time window or clearing the search."
+          : "Nothing closing in this window yet. Try a wider time window above.",
+        top_rated:    hasFilters
+          ? "No high-scored items match your filters. Try widening the time window or clearing the search."
+          : "No scored listings in this time window. Try a wider window above.",
+        watchlist:    "Your watchlist is empty. Click ☆ on any listing to add it.",
+      };
+      return (
+        <div className="text-center py-16 text-slate-400 text-sm">
+          {messages[tab] || "Nothing to show."}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Detail drawer (slides in from the right on click)
+    // -----------------------------------------------------------------------
+
+    function DetailDrawer({ listing, onClose, isWatched, toggleWatch, now, sig }) {
+      useEffect(() => {
+        const handler = (e) => { if (e.key === "Escape") onClose(); };
+        window.addEventListener("keydown", handler);
+        return () => window.removeEventListener("keydown", handler);
+      }, [onClose]);
+
+      const bd = listing.score_breakdown || {};
+      const components = [
+        ["TLD", bd.tld],
+        ["Length", bd.length],
+        ["Composition", bd.composition],
+        ["Word content", bd.word_content],
+        ["Themes", bd.themes],
+        ["the client signals", bd.preference_signals],
+        ["Demand", bd.demand],
+      ];
+      const endMs = listing.end_time_utc ? new Date(listing.end_time_utc).getTime() : null;
+      const remaining = endMs != null ? endMs - now : null;
+
+      return (
+        <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
+          <div className="absolute inset-0 bg-slate-900/30" />
+          <aside
+            onClick={(e) => e.stopPropagation()}
+            className="relative w-full max-w-md bg-white shadow-2xl overflow-y-auto h-full"
+          >
+            {sig != null && sig.sp != null && (
+              // SP flag, loud version (2026-08-28): the $60 misspelled
+              // domain would have been caught right here.
+              <div className="bg-orange-50 border-b border-orange-200 px-4 py-2.5 text-sm text-orange-800">
+                <span className="font-bold">SP — possible misspelling:</span>{" "}
+                <span data-monospace>{sig.sp}</span>. Double-check this is the
+                name you actually want before bidding.
+              </div>
+            )}
+            <div className="p-4 border-b sticky top-0 bg-white flex items-start justify-between gap-3">
+              <div>
+                <div className="text-lg font-semibold" data-monospace>{listing.domain}</div>
+                <div className="text-xs text-slate-500 mt-0.5">
+                  {listing.auction_type === "CLOSEOUT" ? "Closeout" : "Expiring auction"}
+                  {" · "}
+                  {formatPrice(listing.current_price)}
+                  {listing.has_bids && " · has bids"}
+                </div>
+                {remaining != null && (
+                  <div className={`text-sm font-medium mt-1 ${urgencyClass(remaining)}`}>
+                    {formatRemaining(remaining)}
+                    {endMs != null && (
+                      <span className="text-slate-400 font-normal text-xs ml-2">
+                        ({formatEndAbsolute(listing.end_time_utc)})
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={toggleWatch}
+                  className={`text-xs px-2 py-1 rounded border ${
+                    isWatched
+                      ? "bg-amber-50 text-amber-800 border-amber-300"
+                      : "bg-white text-slate-700 hover:bg-slate-50"
+                  }`}
+                >
+                  {isWatched ? "★ Watched" : "☆ Watch"}
+                </button>
+                <button onClick={onClose} className="text-slate-400 hover:text-slate-900 text-xl leading-none">×</button>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-5">
+              <Section title="Domain signals">
+                <table className="w-full text-sm">
+                  <tbody>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">GoDaddy est.</td>
+                      <td className="py-1.5 text-right font-medium text-emerald-600" data-monospace>
+                        {listing.estimated_value ? formatPrice(listing.estimated_value) : "—"}
+                      </td>
+                    </tr>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">Estibot est.</td>
+                      <td className={`py-1.5 text-right font-medium ${sig?.estibot != null && Number(sig.estibot) >= 1000 ? "text-amber-700" : "text-indigo-600"}`} data-monospace>
+                        {sig?.estibot != null ? formatPrice(sig.estibot) : "—"}
+                      </td>
+                    </tr>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">Pages indexed on the web</td>
+                      <td className="py-1.5 text-right" data-monospace>
+                        {sig?.indexed_pages != null ? sig.indexed_pages.toLocaleString() : "—"}
+                      </td>
+                    </tr>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">Extensions taken</td>
+                      <td className="py-1.5 text-right" data-monospace>
+                        {sig?.exact_match_tlds != null
+                          ? `${sig.exact_match_tlds} TLDs${sig?.developed_tlds != null ? ` · ${sig.developed_tlds} developed` : ""}`
+                          : "—"}
+                      </td>
+                    </tr>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">Google searches / mo</td>
+                      <td className={`py-1.5 text-right font-medium ${sig?.search_volume >= 160000 ? "text-amber-700 font-semibold" : ""}`} data-monospace>
+                        {sig?.search_volume != null ? sig.search_volume.toLocaleString() : "—"}
+                        {sig?.search_volume >= 160000 ? " ★" : ""}
+                      </td>
+                    </tr>
+                    <tr className="border-b">
+                      <td className="py-1.5 text-slate-600">Cost per click</td>
+                      <td className="py-1.5 text-right" data-monospace>
+                        {sig?.cpc != null ? `$${Number(sig.cpc).toFixed(2)}` : "—"}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td className="py-1.5 text-slate-600">Renewal (est.)</td>
+                      <td className="py-1.5 text-right" data-monospace>
+                        {sig?.renewal_est != null ? `${formatPrice(sig.renewal_est)}/yr` : "—"}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </Section>
+
+              <Section title="Score">
+                <div className="flex items-center gap-3">
+                  <div className={`text-2xl font-semibold px-3 py-1.5 rounded border ${scoreColor(listing.score)}`}>
+                    {listing.score}
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    {listing.score >= 110 ? "Strong buy signal" :
+                     listing.score >= 90  ? "Worth considering" :
+                     listing.score >= 60  ? "Marginal" : "Low priority"}
+                  </div>
+                </div>
+              </Section>
+
+              {components.some(([_, v]) => v != null) && (
+                <Section title="Score breakdown">
+                  <table className="w-full text-sm">
+                    <tbody>
+                      {components.filter(([_, v]) => v != null).map(([k, v]) => (
+                        <tr key={k} className="border-b last:border-b-0">
+                          <td className="py-1.5 text-slate-600">{k}</td>
+                          <td className={`py-1.5 text-right ${v < 0 ? "text-rose-700" : v > 0 ? "text-emerald-700" : "text-slate-500"}`} data-monospace>
+                            {v > 0 ? `+${v}` : v}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </Section>
+              )}
+
+              {(listing.themes || []).length > 0 && (
+                <Section title="Themes">
+                  <div className="flex flex-wrap gap-1.5">
+                    {listing.themes.map(t => (
+                      <span key={t} className="text-xs px-2 py-1 bg-slate-100 text-slate-700 rounded">{t}</span>
+                    ))}
+                  </div>
+                </Section>
+              )}
+
+              {bd.notes && bd.notes.length > 0 && (
+                <Section title="Why this score?">
+                  <ul className="text-xs text-slate-700 space-y-1 list-disc list-inside">
+                    {bd.notes.map((n, i) => <li key={i}>{n}</li>)}
+                  </ul>
+                </Section>
+              )}
+
+              {(bd.valuation && Object.values(bd.valuation).some(v => v != null)) ? (
+                <Section title="Valuation (Estibot)">
+                  <table className="w-full text-sm">
+                    <tbody>
+                      {Object.entries(bd.valuation).map(([k, v]) => (
+                        <tr key={k} className="border-b last:border-b-0">
+                          <td className="py-1.5 text-slate-600">{k.replace(/_/g, " ")}</td>
+                          <td className="py-1.5 text-right" data-monospace>{v ?? "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </Section>
+              ) : (
+                <Section title="Valuation (Estibot)">
+                  <div className="text-xs text-slate-400 italic">N/A — Estibot not connected.</div>
+                </Section>
+              )}
+
+              {listing.tld_spread_checked && (
+                <Section title="TLD spread">
+                  <div className="text-sm">
+                    <strong>{listing.tld_spread_taken}</strong> of <strong>{listing.tld_spread_checked}</strong> common TLDs already registered
+                    <span className="text-slate-500"> ({Math.round(listing.tld_spread_ratio * 100)}%)</span>
+                  </div>
+                </Section>
+              )}
+
+              <Section title="Identifiers">
+                <div className="text-xs text-slate-500 space-y-0.5" data-monospace>
+                  <div>listing_id: {listing.listing_id}</div>
+                  <div>tld: .{listing.tld}</div>
+                  {listing.estimated_value && <div>estimated_value: ${listing.estimated_value}</div>}
+                  {listing.end_time_utc && <div>ends: {new Date(listing.end_time_utc).toISOString()}</div>}
+                </div>
+              </Section>
+
+              <div className="pt-2 border-t">
+                <a
+                  href={`https://www.godaddy.com/domainsearch/find?domainToCheck=${encodeURIComponent(listing.domain)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-slate-700 hover:text-slate-900 underline"
+                >
+                  Look up on GoDaddy →
+                </a>
+              </div>
+            </div>
+          </aside>
+        </div>
+      );
+    }
+
+    function Section({ title, children }) {
+      return (
+        <section>
+          <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1.5">{title}</div>
+          {children}
+        </section>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mount
+    // -----------------------------------------------------------------------
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

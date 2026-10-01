@@ -1,0 +1,40 @@
+# Fly.io deployment config for the FastAPI backend.
+#
+# Created 2026-05-29. App name is set during `fly launch` -- adjust below
+# if Fly suggested a different one.
+#
+# min_machines_running=1 (NOT 0): the auto-buy/snipe trigger worker runs as
+# an asyncio task INSIDE the API process. With min=0 the machine idled out
+# and the worker silently stopped — armed snipes never fired while asleep
+# (audit R7). Costs ~$2-4/mo; cheap insurance on a real-money system.
+# Also: keep this at exactly ONE machine. Two machines = two trigger workers
+# with no leader election = double-buy risk.
+
+app = "domain-auction-sniper"
+primary_region = "iad"   # us-east; close to GoDaddy + Neon AWS us-east
+
+[build]
+
+[env]
+  # Pydantic-settings reads env on construction. These are non-secret defaults.
+  GODADDY_ENV = "production"
+  LOG_LEVEL = "INFO"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
